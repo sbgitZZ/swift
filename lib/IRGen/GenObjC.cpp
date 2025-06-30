@@ -33,6 +33,7 @@
 #include "swift/ClangImporter/ClangImporter.h"
 #include "swift/Demangling/ManglingMacros.h"
 #include "swift/IRGen/Linking.h"
+#include "swift/SIL/PrettyStackTrace.h"
 #include "swift/SIL/SILModule.h"
 #include "clang/AST/Attr.h"
 #include "clang/AST/DeclObjC.h"
@@ -779,6 +780,8 @@ Callee irgen::getObjCMethodCallee(IRGenFunction &IGF,
                                   llvm::Value *selfValue,
                                   CalleeInfo &&info) {
   SILDeclRef method = methodInfo.getMethod();
+  PrettyStackTraceSILDeclRef entry("lowering reference to ObjC method", method);
+
   // Note that isolated deallocator is never called directly, only from regular
   // deallocator
   assert((method.kind == SILDeclRef::Kind::Initializer
@@ -905,7 +908,8 @@ static llvm::Function *emitObjCPartialApplicationForwarder(IRGenModule &IGM,
                            MANGLE_AS_STRING(OBJC_PARTIAL_APPLY_THUNK_SYM),
                            &IGM.Module);
   fwd->setCallingConv(expandCallingConv(
-      IGM, SILFunctionTypeRepresentation::Thick, false/*isAsync*/));
+      IGM, SILFunctionTypeRepresentation::Thick, false /*isAsync*/,
+      false /*isCalleeAllocatedCoroutine*/));
 
   fwd->setAttributes(attrs);
   // Merge initial attributes with attrs.

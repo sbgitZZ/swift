@@ -87,31 +87,30 @@ static SILValue stripFunctionConversions(SILValue val) {
       continue;
     }
 
+    // Look through thunks.
+    if (auto pai = dyn_cast<PartialApplyInst>(val)) {
+      if (pai->getCalleeFunction()->isThunk()) {
+        val = pai->getArgument(0);
+        continue;
+      }
+    }
+
     break;
   }
 
   return val;
 }
 
-static std::optional<DiagnosticBehavior>
-getDiagnosticBehaviorLimitForCapturedValue(SILFunction *fn,
-                                           CapturedValue value) {
-  ValueDecl *decl = value.getDecl();
-  auto *ctx = decl->getInnermostDeclContext();
-  auto type = fn->mapTypeIntoContext(decl->getInterfaceType());
-  return type->getConcurrencyDiagnosticBehaviorLimit(ctx);
-}
-
 /// Find the most conservative diagnostic behavior by taking the max over all
 /// DiagnosticBehavior for the captured values.
 static std::optional<DiagnosticBehavior>
-getDiagnosticBehaviorLimitForCapturedValues(
-    SILFunction *fn, ArrayRef<CapturedValue> capturedValues) {
+getDiagnosticBehaviorLimitForOperands(SILFunction *fn,
+                                      ArrayRef<Operand *> capturedValues) {
   std::optional<DiagnosticBehavior> diagnosticBehavior;
   for (auto value : capturedValues) {
     auto lhs = diagnosticBehavior.value_or(DiagnosticBehavior::Unspecified);
-    auto rhs = getDiagnosticBehaviorLimitForCapturedValue(fn, value).value_or(
-        DiagnosticBehavior::Unspecified);
+    auto limit = value->get()->getType().getConcurrencyDiagnosticBehavior(fn);
+    auto rhs = limit.value_or(DiagnosticBehavior::Unspecified);
     auto result = lhs.merge(rhs);
     if (result != DiagnosticBehavior::Unspecified)
       diagnosticBehavior = result;
@@ -150,17 +149,16 @@ static std::optional<SILDeclRef> getDeclRefForCallee(SILInstruction *inst) {
   }
 }
 
-static std::optional<std::pair<DescriptiveDeclKind, DeclName>>
-getSendingApplyCalleeInfo(SILInstruction *inst) {
+static std::optional<ValueDecl *> getSendingApplyCallee(SILInstruction *inst) {
   auto declRef = getDeclRefForCallee(inst);
   if (!declRef)
     return {};
 
   auto *decl = declRef->getDecl();
-  if (!decl || !decl->hasName())
+  if (!decl)
     return {};
 
-  return {{decl->getDescriptiveKind(), decl->getName()}};
+  return decl;
 }
 
 static Expr *inferArgumentExprFromApplyExpr(ApplyExpr *sourceApply,
@@ -215,6 +213,105 @@ inferNameAndRootHelper(SILValue value) {
   if (ForceTypedErrors)
     return {};
   return VariableNameInferrer::inferNameAndRoot(value);
+}
+
+/// Find a use corresponding to the potentially recursive capture of \p
+/// initialOperand that would be appropriate for diagnostics.
+///
+/// \returns the use and the function argument that is used. We return the
+/// function argument since it is a clever way to correctly grab the name of the
+/// captured value since the ValueDecl will point at the actual ValueDecl in the
+/// AST that is captured.
+static std::optional<std::pair<Operand *, SILArgument *>>
+findClosureUse(Operand *initialOperand) {
+  // We have to use a small vector worklist here since we are iterating through
+  // uses from different functions.
+  llvm::SmallVector<std::pair<Operand *, SILArgument *>, 64> worklist;
+  llvm::SmallPtrSet<Operand *, 8> visitedOperand;
+
+  // Initialize our worklist with uses in the initial closure. We do not want to
+  // analyze uses in the original function.
+  {
+    auto as = ApplySite::isa(initialOperand->getUser());
+    if (!as)
+      return {};
+
+    auto *f = as.getCalleeFunction();
+    if (!f || f->empty())
+      return {};
+
+    unsigned argumentIndex = as.getCalleeArgIndex(*initialOperand);
+    auto *arg = f->getArgument(argumentIndex);
+    for (auto *use : arg->getUses()) {
+      worklist.emplace_back(use, arg);
+      visitedOperand.insert(use);
+    }
+  }
+
+  while (!worklist.empty()) {
+    auto pair = worklist.pop_back_val();
+    auto *op = pair.first;
+    auto *fArg = pair.second;
+    auto *user = op->getUser();
+
+    // Ignore incidental uses that are not specifically ignored use. We want to
+    // visit those since they represent `let _ = $VAR` and `_ = $VAR`
+    if (isIncidentalUse(user) && !isa<IgnoredUseInst>(user))
+      continue;
+
+    // Look through some insts we do not care about.
+    if (isa<CopyValueInst, BeginBorrowInst, ProjectBoxInst, BeginAccessInst>(
+            user) ||
+        isMoveOnlyWrapperUse(user) ||
+        // We want to treat move_value [var_decl] as a real use since we are
+        // assigning to a var.
+        (isa<MoveValueInst>(user) &&
+         !cast<MoveValueInst>(user)->isFromVarDecl())) {
+      for (auto result : user->getResults()) {
+        for (auto *use : result->getUses()) {
+          if (visitedOperand.insert(use).second)
+            worklist.emplace_back(use, fArg);
+        }
+      }
+      continue;
+    }
+
+    // See if we have a callee function. In such a case, find our operand in the
+    // callee and visit its uses.
+    if (auto as = dyn_cast<PartialApplyInst>(op->getUser())) {
+      if (auto *f = as->getCalleeFunction(); f && !f->empty()) {
+        auto *fArg = f->getArgument(ApplySite(as).getCalleeArgIndex(*op));
+        for (auto *use : fArg->getUses()) {
+          if (visitedOperand.insert(use).second)
+            worklist.emplace_back(use, fArg);
+        }
+        continue;
+      }
+    }
+
+    // See if we have a full apply site that was from a closure that was
+    // immediately invoked. In such a case, we can emit a better diagnostic in
+    // the called closure.
+    if (auto fas = FullApplySite::isa(op->getUser())) {
+      if (auto *f = fas.getCalleeFunction(); f && !f->empty()) {
+        auto *fArg = cast<SILFunctionArgument>(
+            f->getArgument(fas.getCalleeArgIndex(*op)));
+        if (fArg->isClosureCapture()) {
+          for (auto *use : fArg->getUses()) {
+            if (visitedOperand.insert(use).second)
+              worklist.emplace_back(use, fArg);
+          }
+          continue;
+        }
+      }
+    }
+
+    // Otherwise, we have a real use. Return it and the function argument that
+    // it was derived from.
+    return pair;
+  }
+
+  return {};
 }
 
 //===----------------------------------------------------------------------===//
@@ -574,10 +671,9 @@ public:
         getFunction());
   }
 
-  /// If we can find a callee decl name, return that. None otherwise.
-  std::optional<std::pair<DescriptiveDeclKind, DeclName>>
-  getSendingCalleeInfo() const {
-    return getSendingApplyCalleeInfo(sendingOp->getUser());
+  /// Attempts to retrieve and return the callee declaration.
+  std::optional<const ValueDecl *> getSendingCallee() const {
+    return getSendingApplyCallee(sendingOp->getUser());
   }
 
   void
@@ -599,12 +695,11 @@ public:
       }
     }
 
-    if (auto calleeInfo = getSendingCalleeInfo()) {
+    if (auto callee = getSendingCallee()) {
       diagnoseNote(
           loc, diag::regionbasedisolation_named_info_send_yields_race_callee,
           name, descriptiveKindStr, isolationCrossing.getCalleeIsolation(),
-          calleeInfo->first, calleeInfo->second,
-          isolationCrossing.getCallerIsolation());
+          callee.value(), isolationCrossing.getCallerIsolation());
     } else {
       diagnoseNote(loc, diag::regionbasedisolation_named_info_send_yields_race,
                    name, descriptiveKindStr,
@@ -618,8 +713,7 @@ public:
   emitNamedIsolationCrossingError(SILLocation loc, Identifier name,
                                   SILIsolationInfo namedValuesIsolationInfo,
                                   ApplyIsolationCrossing isolationCrossing,
-                                  DeclName calleeDeclName,
-                                  DescriptiveDeclKind calleeDeclKind) {
+                                  const ValueDecl *callee) {
     // Emit the short error.
     diagnoseError(loc, diag::regionbasedisolation_named_send_yields_race, name)
         .highlight(loc.getSourceRange())
@@ -638,7 +732,7 @@ public:
     diagnoseNote(
         loc, diag::regionbasedisolation_named_info_send_yields_race_callee,
         name, descriptiveKindStr, isolationCrossing.getCalleeIsolation(),
-        calleeDeclKind, calleeDeclName, isolationCrossing.getCallerIsolation());
+        callee, isolationCrossing.getCallerIsolation());
     emitRequireInstDiagnostics();
   }
 
@@ -661,11 +755,10 @@ public:
         .highlight(loc.getSourceRange())
         .limitBehaviorIf(getBehaviorLimit());
 
-    if (auto calleeInfo = getSendingCalleeInfo()) {
+    if (auto callee = getSendingCallee()) {
       diagnoseNote(loc, diag::regionbasedisolation_type_use_after_send_callee,
                    inferredType, isolationCrossing.getCalleeIsolation(),
-                   calleeInfo->first, calleeInfo->second,
-                   isolationCrossing.getCallerIsolation());
+                   callee.value(), isolationCrossing.getCallerIsolation());
     } else {
       diagnoseNote(loc, diag::regionbasedisolation_type_use_after_send,
                    inferredType, isolationCrossing.getCalleeIsolation(),
@@ -695,10 +788,10 @@ public:
                   inferredType)
         .highlight(loc.getSourceRange())
         .limitBehaviorIf(getBehaviorLimit());
-    if (auto calleeInfo = getSendingCalleeInfo()) {
+    if (auto callee = getSendingCallee()) {
       diagnoseNote(loc,
                    diag::regionbasedisolation_typed_use_after_sending_callee,
-                   inferredType, calleeInfo->first, calleeInfo->second);
+                   inferredType, callee.value());
     } else {
       diagnoseNote(loc, diag::regionbasedisolation_typed_use_after_sending,
                    inferredType);
@@ -855,33 +948,28 @@ private:
 
 bool UseAfterSendDiagnosticInferrer::initForIsolatedPartialApply(
     Operand *op, AbstractClosureExpr *ace) {
-  SmallVector<std::tuple<CapturedValue, unsigned, ApplyIsolationCrossing>, 8>
-      foundCapturedIsolationCrossing;
-  ace->getIsolationCrossing(foundCapturedIsolationCrossing);
-  if (foundCapturedIsolationCrossing.empty())
+  auto diagnosticPair = findClosureUse(op);
+  if (!diagnosticPair) {
     return false;
-
-  unsigned opIndex = ApplySite(op->getUser()).getASTAppliedArgIndex(*op);
-  bool emittedDiagnostic = false;
-  for (auto &p : foundCapturedIsolationCrossing) {
-    if (std::get<1>(p) != opIndex)
-      continue;
-    emittedDiagnostic = true;
-
-    auto &state = sendingOpToStateMap.get(sendingOp);
-    if (auto rootValueAndName = inferNameAndRootHelper(sendingOp->get())) {
-      diagnosticEmitter.emitNamedIsolationCrossingDueToCapture(
-          RegularLocation(std::get<0>(p).getLoc()), rootValueAndName->first,
-          state.isolationInfo.getIsolationInfo(), std::get<2>(p));
-      continue;
-    }
-
-    diagnosticEmitter.emitTypedIsolationCrossingDueToCapture(
-        RegularLocation(std::get<0>(p).getLoc()), baseInferredType,
-        std::get<2>(p));
   }
 
-  return emittedDiagnostic;
+  auto *diagnosticOp = diagnosticPair->first;
+
+  ApplyIsolationCrossing crossing(
+      *op->getFunction()->getActorIsolation(),
+      *diagnosticOp->getFunction()->getActorIsolation());
+
+  auto &state = sendingOpToStateMap.get(sendingOp);
+  if (auto rootValueAndName = inferNameAndRootHelper(sendingOp->get())) {
+    diagnosticEmitter.emitNamedIsolationCrossingDueToCapture(
+        diagnosticOp->getUser()->getLoc(), rootValueAndName->first,
+        state.isolationInfo.getIsolationInfo(), crossing);
+    return true;
+  }
+
+  diagnosticEmitter.emitTypedIsolationCrossingDueToCapture(
+      diagnosticOp->getUser()->getLoc(), baseInferredType, crossing);
+  return true;
 }
 
 void UseAfterSendDiagnosticInferrer::initForApply(Operand *op,
@@ -985,7 +1073,7 @@ struct UseAfterSendDiagnosticInferrer::AutoClosureWalker : ASTWalker {
           continue;
         }
 
-        // Otherwise, we are calling an actor isolated function in the async
+        // Otherwise, we are calling an actor-isolated function in the async
         // let. Emit a better error.
 
         // See if we can find a valueDecl/name for our callee so we can
@@ -1013,8 +1101,7 @@ struct UseAfterSendDiagnosticInferrer::AutoClosureWalker : ASTWalker {
           if (valueDecl->hasName()) {
             foundTypeInfo.diagnosticEmitter.emitNamedIsolationCrossingError(
                 foundTypeInfo.baseLoc, targetDecl->getBaseIdentifier(),
-                targetDeclIsolationInfo, *isolationCrossing,
-                valueDecl->getName(), valueDecl->getDescriptiveKind());
+                targetDeclIsolationInfo, *isolationCrossing, valueDecl);
             continue;
           }
 
@@ -1229,10 +1316,9 @@ public:
         getOperand()->getFunction());
   }
 
-  /// If we can find a callee decl name, return that. None otherwise.
-  std::optional<std::pair<DescriptiveDeclKind, DeclName>>
-  getSendingCalleeInfo() const {
-    return getSendingApplyCalleeInfo(sendingOperand->getUser());
+  /// Attempts to retrieve and return the callee declaration.
+  std::optional<const ValueDecl *> getSendingCallee() const {
+    return getSendingApplyCallee(sendingOperand->getUser());
   }
 
   SILLocation getLoc() const { return sendingOperand->getUser()->getLoc(); }
@@ -1272,12 +1358,12 @@ public:
       getIsolationRegionInfo().printForDiagnostics(os);
     }
 
-    if (auto calleeInfo = getSendingCalleeInfo()) {
+    if (auto callee = getSendingCallee()) {
       diagnoseNote(
           loc,
           diag::regionbasedisolation_typed_sendneversendable_via_arg_callee,
           descriptiveKindStr, inferredType, crossing.getCalleeIsolation(),
-          calleeInfo->first, calleeInfo->second);
+          callee.value());
     } else {
       diagnoseNote(
           loc, diag::regionbasedisolation_typed_sendneversendable_via_arg,
@@ -1316,56 +1402,78 @@ public:
       getIsolationRegionInfo().printForDiagnostics(os);
     }
 
-    if (auto calleeInfo = getSendingCalleeInfo()) {
+    if (auto callee = getSendingCallee()) {
       diagnoseNote(
           loc, diag::regionbasedisolation_typed_tns_passed_to_sending_callee,
-          descriptiveKindStr, inferredType, calleeInfo->first,
-          calleeInfo->second);
+          descriptiveKindStr, inferredType, callee.value());
     } else {
       diagnoseNote(loc, diag::regionbasedisolation_typed_tns_passed_to_sending,
                    descriptiveKindStr, inferredType);
     }
   }
 
-  /// Only use if we were able to find the actual isolated value.
-  void emitTypedSendingNeverSendableToSendingClosureParamDirectlyIsolated(
-      SILLocation loc, CapturedValue capturedValue) {
+  /// Emit an error for a case where we have captured a value like an actor and
+  /// thus a sending closure has become actor isolated (and thus unable to be
+  /// sent).
+  void emitClosureErrorWithCapturedActor(Operand *partialApplyOp,
+                                         Operand *actualUse,
+                                         SILArgument *fArg) {
     SmallString<64> descriptiveKindStr;
     {
       llvm::raw_svector_ostream os(descriptiveKindStr);
-      if (getIsolationRegionInfo().getIsolationInfo().isTaskIsolated()) {
-        os << "code in the current task";
-      } else {
-        getIsolationRegionInfo().printForDiagnostics(os);
-        os << " code";
-      }
+      getIsolationRegionInfo().getIsolationInfo().printForCodeDiagnostic(os);
     }
 
-    diagnoseError(loc,
+    diagnoseError(partialApplyOp,
                   diag::regionbasedisolation_typed_tns_passed_sending_closure,
                   descriptiveKindStr)
-        .highlight(loc.getSourceRange())
-        .limitBehaviorIf(getDiagnosticBehaviorLimitForCapturedValue(
-            getFunction(), capturedValue));
+        .limitBehaviorIf(getDiagnosticBehaviorLimitForOperands(
+            actualUse->getFunction(), {actualUse}));
 
-    auto capturedLoc = RegularLocation(capturedValue.getLoc());
+    descriptiveKindStr.clear();
+    {
+      llvm::raw_svector_ostream os(descriptiveKindStr);
+      getIsolationRegionInfo().getIsolationInfo().printForDiagnostics(os);
+    }
+    diagnoseNote(actualUse, diag::regionbasedisolation_closure_captures_actor,
+                 fArg->getDecl()->getName(), descriptiveKindStr);
+  }
+
+  /// Emit a typed error for an isolated closure being passed as a sending
+  /// parameter.
+  ///
+  /// \arg partialApplyOp the operand of the outermost partial apply.
+  /// \arg actualUse the operand inside the closure that actually caused the
+  /// capture to occur. This maybe inside a different function from the partial
+  /// apply since we want to support a use inside a recursive closure.
+  void emitSendingClosureParamDirectlyIsolated(Operand *partialApplyOp,
+                                               Operand *actualUse,
+                                               SILArgument *fArg) {
+    SmallString<64> descriptiveKindStr;
+    {
+      llvm::raw_svector_ostream os(descriptiveKindStr);
+      getIsolationRegionInfo().getIsolationInfo().printForCodeDiagnostic(os);
+    }
+
+    diagnoseError(partialApplyOp,
+                  diag::regionbasedisolation_typed_tns_passed_sending_closure,
+                  descriptiveKindStr)
+        .limitBehaviorIf(getDiagnosticBehaviorLimitForOperands(
+            actualUse->getFunction(), {actualUse}));
+
+    // If we have a closure capture box, emit a special diagnostic.
     if (getIsolationRegionInfo().getIsolationInfo().isTaskIsolated()) {
-      // If we have a closure capture box, emit a special diagnostic.
-      if (auto *fArg = dyn_cast<SILFunctionArgument>(
-              getIsolationRegionInfo().getIsolationInfo().getIsolatedValue())) {
-        if (fArg->isClosureCapture() && fArg->getType().is<SILBoxType>()) {
-          auto diag = diag::
-              regionbasedisolation_typed_tns_passed_to_sending_closure_helper_have_boxed_value_task_isolated;
-          auto *decl = capturedValue.getDecl();
-          diagnoseNote(capturedLoc, diag, decl->getName(),
-                       decl->getDescriptiveKind());
-          return;
-        }
+      if (cast<SILFunctionArgument>(fArg)->isClosureCapture() &&
+          fArg->getType().is<SILBoxType>()) {
+        auto diag = diag::
+            regionbasedisolation_typed_tns_passed_to_sending_closure_helper_have_boxed_value_task_isolated;
+        diagnoseNote(actualUse, diag, fArg->getDecl());
+        return;
       }
 
       auto diag = diag::
           regionbasedisolation_typed_tns_passed_to_sending_closure_helper_have_value_task_isolated;
-      diagnoseNote(capturedLoc, diag, capturedValue.getDecl()->getName());
+      diagnoseNote(actualUse, diag, fArg->getDecl()->getName());
       return;
     }
 
@@ -1377,41 +1485,55 @@ public:
 
     auto diag = diag::
         regionbasedisolation_typed_tns_passed_to_sending_closure_helper_have_value;
-    diagnoseNote(capturedLoc, diag, descriptiveKindStr,
-                 capturedValue.getDecl()->getName());
+    diagnoseNote(actualUse, diag, descriptiveKindStr,
+                 fArg->getDecl()->getName());
   }
 
-  void emitTypedSendingNeverSendableToSendingClosureParam(
-      SILLocation loc, ArrayRef<CapturedValue> capturedValues) {
+  void emitSendingClosureMultipleCapturedOperandError(
+      SILLocation loc, ArrayRef<Operand *> capturedOperands) {
+    // Our caller should have passed at least one operand. Emit an unknown error
+    // to signal we need a bug report.
+    if (capturedOperands.empty()) {
+      emitUnknownPatternError();
+      return;
+    }
+
     SmallString<64> descriptiveKindStr;
     {
       llvm::raw_svector_ostream os(descriptiveKindStr);
-      if (getIsolationRegionInfo().getIsolationInfo().isTaskIsolated()) {
-        os << "code in the current task";
-      } else {
-        getIsolationRegionInfo().printForDiagnostics(os);
-        os << " code";
-      }
+      getIsolationRegionInfo()->printForCodeDiagnostic(os);
     }
 
-    auto behaviorLimit = getDiagnosticBehaviorLimitForCapturedValues(
-        getFunction(), capturedValues);
-    diagnoseError(loc,
-                  diag::regionbasedisolation_typed_tns_passed_sending_closure,
-                  descriptiveKindStr)
-        .highlight(loc.getSourceRange())
-        .limitBehaviorIf(behaviorLimit);
+    auto emitMainError = [&] {
+      auto behaviorLimit = getDiagnosticBehaviorLimitForOperands(
+          getFunction(), capturedOperands);
+      diagnoseError(loc,
+                    diag::regionbasedisolation_typed_tns_passed_sending_closure,
+                    descriptiveKindStr)
+          .highlight(loc.getSourceRange())
+          .limitBehaviorIf(behaviorLimit);
+    };
 
-    if (capturedValues.size() == 1) {
-      auto captured = capturedValues.front();
-      auto capturedLoc = RegularLocation(captured.getLoc());
-      if (getIsolationRegionInfo().getIsolationInfo().isTaskIsolated()) {
-        auto diag = diag::
-            regionbasedisolation_typed_tns_passed_to_sending_closure_helper_have_value_task_isolated;
-        diagnoseNote(capturedLoc, diag, captured.getDecl()->getName());
+    if (capturedOperands.size() == 1) {
+      auto captured = capturedOperands.front();
+      auto actualUseInfo = findClosureUse(captured);
+
+      // If we fail to find actual use info, emit an unknown error.
+      if (!actualUseInfo) {
+        emitUnknownPatternError();
         return;
       }
 
+      if (getIsolationRegionInfo()->isTaskIsolated()) {
+        emitMainError();
+        auto diag = diag::
+            regionbasedisolation_typed_tns_passed_to_sending_closure_helper_have_value_task_isolated;
+        diagnoseNote(actualUseInfo->first, diag,
+                     actualUseInfo->second->getDecl()->getName());
+        return;
+      }
+
+      emitMainError();
       descriptiveKindStr.clear();
       {
         llvm::raw_svector_ostream os(descriptiveKindStr);
@@ -1419,16 +1541,29 @@ public:
       }
       auto diag = diag::
           regionbasedisolation_typed_tns_passed_to_sending_closure_helper_have_value_region;
-      diagnoseNote(capturedLoc, diag, descriptiveKindStr,
-                   captured.getDecl()->getName());
+      diagnoseNote(actualUseInfo->first, diag, descriptiveKindStr,
+                   actualUseInfo->second->getDecl()->getName());
       return;
     }
 
-    for (auto captured : capturedValues) {
-      auto capturedLoc = RegularLocation(captured.getLoc());
+    emitMainError();
+
+    bool emittedDiagnostic = false;
+    for (auto captured : capturedOperands) {
+      auto actualUseInfo = findClosureUse(captured);
+      if (!actualUseInfo)
+        continue;
+      emittedDiagnostic = true;
       auto diag = diag::
           regionbasedisolation_typed_tns_passed_to_sending_closure_helper_multiple_value;
-      diagnoseNote(capturedLoc, diag, captured.getDecl()->getName());
+      diagnoseNote(actualUseInfo->first, diag,
+                   actualUseInfo->second->getDecl()->getName());
+    }
+
+    // Check if we did not emit a diagnostic. In such a case, we need to emit an
+    // unknown patten error so that we get a bug report from the user.
+    if (!emittedDiagnostic) {
+      emitUnknownPatternError();
     }
   }
 
@@ -1470,12 +1605,12 @@ public:
         descriptiveKindStrWithSpace.push_back(' ');
       }
     }
-    if (auto calleeInfo = getSendingCalleeInfo()) {
+    if (auto callee = getSendingCallee()) {
       diagnoseNote(loc,
                    diag::regionbasedisolation_named_send_never_sendable_callee,
                    name, descriptiveKindStrWithSpace,
-                   isolationCrossing.getCalleeIsolation(), calleeInfo->first,
-                   calleeInfo->second, descriptiveKindStr);
+                   isolationCrossing.getCalleeIsolation(), callee.value(),
+                   descriptiveKindStr);
     } else {
       diagnoseNote(loc, diag::regionbasedisolation_named_send_never_sendable,
                    name, descriptiveKindStrWithSpace,
@@ -1544,6 +1679,12 @@ private:
   }
 
   template <typename... T, typename... U>
+  InFlightDiagnostic diagnoseError(Operand *op, Diag<T...> diag, U &&...args) {
+    return diagnoseError(op->getUser()->getLoc(), diag,
+                         std::forward<U>(args)...);
+  }
+
+  template <typename... T, typename... U>
   InFlightDiagnostic diagnoseNote(SourceLoc loc, Diag<T...> diag, U &&...args) {
     return getASTContext().Diags.diagnose(loc, diag, std::forward<U>(args)...);
   }
@@ -1558,6 +1699,12 @@ private:
   InFlightDiagnostic diagnoseNote(SILInstruction *inst, Diag<T...> diag,
                                   U &&...args) {
     return diagnoseNote(inst->getLoc(), diag, std::forward<U>(args)...);
+  }
+
+  template <typename... T, typename... U>
+  InFlightDiagnostic diagnoseNote(Operand *op, Diag<T...> diag, U &&...args) {
+    return diagnoseNote(op->getUser()->getLoc(), diag,
+                        std::forward<U>(args)...);
   }
 };
 
@@ -1596,7 +1743,7 @@ private:
   getIsolatedValuePartialApplyIndex(PartialApplyInst *pai,
                                     SILValue isolatedValue) {
     for (auto &paiOp : ApplySite(pai).getArgumentOperands()) {
-      if (valueMap.getTrackableValue(paiOp.get()).getRepresentative() ==
+      if (valueMap.getTrackableValue(paiOp.get()).value.getRepresentative() ==
           isolatedValue) {
         return ApplySite(pai).getASTAppliedArgIndex(paiOp);
       }
@@ -1609,97 +1756,124 @@ private:
 } // namespace
 
 bool SentNeverSendableDiagnosticInferrer::initForSendingPartialApply(
-    FullApplySite fas, Operand *paiOp) {
-  auto *pai =
-      dyn_cast<PartialApplyInst>(stripFunctionConversions(paiOp->get()));
-  if (!pai)
+    FullApplySite fas, Operand *callsiteOp) {
+  // This is the partial apply that is being passed as a sending parameter.
+  auto *sendingPAI =
+      dyn_cast<PartialApplyInst>(stripFunctionConversions(callsiteOp->get()));
+  if (!sendingPAI)
     return false;
 
-  // For now we want this to be really narrow and to only apply to closure
-  // literals.
-  auto *ce = pai->getLoc().getAsASTNode<ClosureExpr>();
-  if (!ce)
+  // Make sure that we only handle closure literals.
+  //
+  // TODO: This should be marked on closures at the SIL level... I shouldn't
+  // have to refer to the AST.
+  if (!sendingPAI->getLoc().getAsASTNode<ClosureExpr>())
     return false;
 
-  // Ok, we now know we have a partial apply and it is a closure literal. Lets
-  // see if we can find the exact thing that caused the closure literal to be
-  // actor isolated.
-  auto isolationInfo = diagnosticEmitter.getIsolationRegionInfo();
-  if (isolationInfo->hasIsolatedValue()) {
-    // Now that we have the value, see if that value is one of our captured
-    // values.
-    auto isolatedValue = isolationInfo->getIsolatedValue();
-    auto matchingElt = getIsolatedValuePartialApplyIndex(pai, isolatedValue);
-    if (matchingElt) {
-      // Ok, we found the matching element. Lets emit our diagnostic!
-      auto capture = ce->getCaptureInfo().getCaptures()[*matchingElt];
-      diagnosticEmitter
-          .emitTypedSendingNeverSendableToSendingClosureParamDirectlyIsolated(
-              ce, capture);
-      return true;
-    }
-  }
-
-  // Ok, we are not tracking an actual isolated value or we do not capture the
-  // isolated value directly... we need to be smarter here. First lets gather up
-  // all non-Sendable values captured by the closure.
-  SmallVector<CapturedValue, 8> nonSendableCaptures;
-  for (auto capture : ce->getCaptureInfo().getCaptures()) {
-    auto *decl = capture.getDecl();
-    auto type = decl->getInterfaceType()->getCanonicalType();
-    auto silType = SILType::getPrimitiveObjectType(type);
-    if (!SILIsolationInfo::isNonSendableType(silType, pai->getFunction()))
+  // Ok, we have a closure literal. First we handle a potential capture of
+  // 'self' before we do anything by looping over our captured parameters.
+  //
+  // DISCUSSION: The reason why we do this early is that as a later heuristic,
+  // we check if any of the values are directly task isolated (i.e. they are
+  // actually the task isolated value, not a value that is in the same region as
+  // something that is task isolated). This could potentially result in us
+  // emitting a task isolated error instead of an actor isolated error here if
+  // for some reason SILGen makes the self capture come later in the capture
+  // list. From a compile time perspective, going over a list of captures twice
+  // is not going to hurt especially since we are going to emit a diagnostic
+  // here anyways.
+  for (auto &sendingPAIOp : sendingPAI->getArgumentOperands()) {
+    // NOTE: If we access a field on self in the closure, we will still just
+    // capture self... so we do not have to handle that case due to the way
+    // SILGen codegens today. This is also true if we use a capture list [x =
+    // self.field] (i.e. a closure that captures a field from self is still
+    // nonisolated).
+    if (!sendingPAIOp.get()->getType().isAnyActor())
       continue;
 
-    auto *fromDC = decl->getInnermostDeclContext();
-    auto *nom = silType.getNominalOrBoundGenericNominal();
-    if (nom && fromDC) {
-      if (auto diagnosticBehavior =
-              getConcurrencyDiagnosticBehaviorLimit(nom, fromDC)) {
-        if (*diagnosticBehavior == DiagnosticBehavior::Ignore)
-          continue;
-      }
+    auto *fArg = dyn_cast<SILFunctionArgument>(
+        lookThroughOwnershipInsts(sendingPAIOp.get()));
+    if (!fArg || !fArg->isSelf())
+      continue;
+
+    auto capturedValue = findClosureUse(&sendingPAIOp);
+    if (!capturedValue) {
+      // If we failed to find the direct capture of self, emit an unknown code
+      // pattern error so the user knows to send a bug report. This should never
+      // fail.
+      diagnosticEmitter.emitUnknownPatternError();
+      return true;
     }
-    nonSendableCaptures.push_back(capture);
+
+    // Otherwise, emit our captured actor error.
+    diagnosticEmitter.emitClosureErrorWithCapturedActor(
+        &sendingPAIOp, capturedValue->first, capturedValue->second);
+    return true;
   }
 
-  // If we do not have any non-Sendable captures... bail.
-  if (nonSendableCaptures.empty())
-    return false;
+  // Ok, we know that we have a closure expr. We now need to find the specific
+  // closure captured value that is actor or task isolated. Then we search for
+  // the potentially recursive closure use so we can show a nice loc to the
+  // user.
+  auto maybeIsolatedValue =
+      diagnosticEmitter.getIsolationRegionInfo()->maybeGetIsolatedValue();
 
-  // Otherwise, emit the diagnostic.
-  diagnosticEmitter.emitTypedSendingNeverSendableToSendingClosureParam(
-      ce, nonSendableCaptures);
+  // If we do not find an actual task isolated value while looping below, this
+  // contains the non sendable captures of the partial apply that we want to
+  // emit a more heuristic based error for. See documentation below.
+  SmallVector<Operand *, 8> nonSendableOps;
+
+  for (auto &sendingPAIOp : sendingPAI->getArgumentOperands()) {
+    // If our value's rep is task isolated or is the dynamic isolated
+    // value... then we are done. This is a 'correct' error value to emit.
+    auto trackableValue = valueMap.getTrackableValue(sendingPAIOp.get());
+    if (trackableValue.value.isSendable())
+      continue;
+
+    auto rep = trackableValue.value.getRepresentative().maybeGetValue();
+    nonSendableOps.push_back(&sendingPAIOp);
+
+    if (trackableValue.value.getIsolationRegionInfo().isTaskIsolated() ||
+        rep == maybeIsolatedValue) {
+      if (auto capturedValue = findClosureUse(&sendingPAIOp)) {
+        diagnosticEmitter.emitSendingClosureParamDirectlyIsolated(
+            callsiteOp, capturedValue->first, capturedValue->second);
+        return true;
+      }
+    }
+  }
+
+  // If we did not find a clear answer in terms of an isolated value, we emit a
+  // more general error based on:
+  //
+  // 1. If we have one non-Sendable value then we know that must be the value.
+  // 2. Otherwise, we emit a generic captured non-Sendable value error to give
+  //    people something to work off of.
+  diagnosticEmitter.emitSendingClosureMultipleCapturedOperandError(
+      callsiteOp->getUser()->getLoc(), nonSendableOps);
   return true;
 }
 
 bool SentNeverSendableDiagnosticInferrer::initForIsolatedPartialApply(
     Operand *op, AbstractClosureExpr *ace,
     std::optional<ActorIsolation> actualCallerIsolation) {
-  SmallVector<std::tuple<CapturedValue, unsigned, ApplyIsolationCrossing>, 8>
-      foundCapturedIsolationCrossing;
-  ace->getIsolationCrossing(foundCapturedIsolationCrossing);
-  if (foundCapturedIsolationCrossing.empty())
+  auto diagnosticPair = findClosureUse(op);
+  if (!diagnosticPair)
     return false;
 
-  // We use getASTAppliedArgIndex instead of getAppliedArgIndex to ensure that
-  // we ignore for our indexing purposes any implicit initial parameters like
-  // isolated(any).
-  unsigned opIndex = ApplySite(op->getUser()).getASTAppliedArgIndex(*op);
-  for (auto &p : foundCapturedIsolationCrossing) {
-    if (std::get<1>(p) == opIndex) {
-      auto loc = RegularLocation(std::get<0>(p).getLoc());
-      auto crossing = std::get<2>(p);
-      auto declIsolation = crossing.getCallerIsolation();
-      auto closureIsolation = crossing.getCalleeIsolation();
-      if (!bool(declIsolation) && actualCallerIsolation) {
-        declIsolation = *actualCallerIsolation;
-      }
-      diagnosticEmitter.emitNamedFunctionArgumentClosure(
-          loc, std::get<0>(p).getDecl()->getBaseIdentifier(),
-          ApplyIsolationCrossing(declIsolation, closureIsolation));
-      return true;
-    }
+  auto *diagnosticOp = diagnosticPair->first;
+
+  ApplyIsolationCrossing crossing(
+      *op->getFunction()->getActorIsolation(),
+      *diagnosticOp->getFunction()->getActorIsolation());
+
+  // We do not need to worry about failing to infer a name here since we are
+  // going to be returning some form of a SILFunctionArgument which is always
+  // easy to find a name for.
+  if (auto rootValueAndName = inferNameAndRootHelper(op->get())) {
+    diagnosticEmitter.emitNamedFunctionArgumentClosure(
+        diagnosticOp->getUser()->getLoc(), rootValueAndName->first, crossing);
+    return true;
   }
 
   return false;
@@ -2285,15 +2459,13 @@ static void addSendableFixIt(const NominalTypeDecl *nominal,
 /// Add Fix-It text for the given generic param declaration type to adopt
 /// Sendable.
 static void addSendableFixIt(const GenericTypeParamDecl *genericArgument,
-                             InFlightDiagnostic &diag, bool unchecked) {
+                             InFlightDiagnostic &diag) {
   if (genericArgument->getInherited().empty()) {
     auto fixItLoc = genericArgument->getLoc();
-    diag.fixItInsertAfter(fixItLoc,
-                          unchecked ? ": @unchecked Sendable" : ": Sendable");
+    diag.fixItInsertAfter(fixItLoc, ": Sendable");
   } else {
     auto fixItLoc = genericArgument->getInherited().getEndLoc();
-    diag.fixItInsertAfter(fixItLoc,
-                          unchecked ? ", @unchecked Sendable" : ", Sendable");
+    diag.fixItInsertAfter(fixItLoc, " & Sendable");
   }
 }
 
@@ -2434,7 +2606,7 @@ void NonSendableIsolationCrossingResultDiagnosticEmitter::emit() {
     return emitUnknownPatternError();
 
   auto type = getType();
-  if (auto *decl = getCalledDecl()) {
+  if (getCalledDecl()) {
     diagnoseError(error.op->getSourceInst(), diag::rbi_isolation_crossing_result,
                   type, isolationCrossing->getCalleeIsolation(), getCalledDecl(),
                   isolationCrossing->getCallerIsolation())
@@ -2474,7 +2646,7 @@ void NonSendableIsolationCrossingResultDiagnosticEmitter::emit() {
           genericParamTypeDecl->getModuleContext() == moduleDecl) {
         auto diag = genericParamTypeDecl->diagnose(
             diag::rbi_add_generic_parameter_sendable_conformance, type);
-        addSendableFixIt(genericParamTypeDecl, diag, /*unchecked=*/false);
+        addSendableFixIt(genericParamTypeDecl, diag);
         return;
       }
     }
@@ -2513,24 +2685,15 @@ struct DiagnosticEvaluator final
 
   void handleLocalUseAfterSend(LocalUseAfterSendError error) const {
     const auto &partitionOp = *error.op;
-
-    auto &operandState = operandToStateMap.get(error.sendingOp);
-    // Ignore this if we have a gep like instruction that is returning a
-    // sendable type and sendingOp was not set with closure
-    // capture.
-    if (auto *svi =
-            dyn_cast<SingleValueInstruction>(partitionOp.getSourceInst())) {
-      if (isa<TupleElementAddrInst, StructElementAddrInst>(svi) &&
-          !SILIsolationInfo::isNonSendableType(svi->getType(),
-                                               svi->getFunction())) {
-        bool isCapture = operandState.isClosureCaptured;
-        if (!isCapture) {
-          return;
-        }
-      }
-    }
-
     REGIONBASEDISOLATION_LOG(error.print(llvm::dbgs(), info->getValueMap()));
+
+    // Ignore this if we are erroring on a mutable base of a Sendable value and
+    // if when we sent the value's region was not closure captured.
+    if (error.op->getOptions().containsOnly(
+            PartitionOp::Flag::RequireOfMutableBaseOfSendableValue) &&
+        !operandToStateMap.get(error.sendingOp).isClosureCaptured)
+      return;
+
     sendingOpToRequireInstMultiMap.insert(
         error.sendingOp, RequireInst::forUseAfterSend(partitionOp.getSourceInst()));
   }
@@ -2603,13 +2766,13 @@ struct DiagnosticEvaluator final
   }
 
   std::optional<Element> getElement(SILValue value) const {
-    return info->getValueMap().getTrackableValue(value).getID();
+    return info->getValueMap().getTrackableValue(value).value.getID();
   }
 
   SILValue getRepresentative(SILValue value) const {
     return info->getValueMap()
         .getTrackableValue(value)
-        .getRepresentative()
+        .value.getRepresentative()
         .maybeGetValue();
   }
 

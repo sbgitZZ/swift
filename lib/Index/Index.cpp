@@ -20,6 +20,7 @@
 #include "swift/AST/Module.h"
 #include "swift/AST/ParameterList.h"
 #include "swift/AST/Pattern.h"
+#include "swift/AST/PrettyStackTrace.h"
 #include "swift/AST/ProtocolConformance.h"
 #include "swift/AST/SourceFile.h"
 #include "swift/AST/Stmt.h"
@@ -32,11 +33,13 @@
 #include "swift/IDE/SourceEntityWalker.h"
 #include "swift/IDE/Utils.h"
 #include "swift/Markup/Markup.h"
+#include "swift/Parse/Lexer.h"
 #include "swift/Sema/IDETypeChecking.h"
 #include "llvm/ADT/APInt.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/FileSystem.h"
+#include <optional>
 #include <tuple>
 
 using namespace swift;
@@ -431,7 +434,7 @@ struct MappedLoc {
 class IndexSwiftASTWalker : public SourceEntityWalker {
   IndexDataConsumer &IdxConsumer;
   SourceManager &SrcMgr;
-  unsigned BufferID;
+  std::optional<unsigned> BufferID;
   bool enableWarnings;
 
   ModuleDecl *CurrentModule = nullptr;
@@ -549,7 +552,9 @@ class IndexSwiftASTWalker : public SourceEntityWalker {
     assert(D);
     if (auto *VD = dyn_cast<ValueDecl>(D)) {
       if (!shouldIndex(VD, /*IsRef*/ true))
-        return true;
+        // Let the caller continue while discarding the relation to a symbol
+        // that won't appear in the index.
+        return false;
     }
     auto Match = std::find_if(Info.Relations.begin(), Info.Relations.end(),
                               [D](IndexRelation R) { return R.decl == D; });
@@ -592,7 +597,7 @@ public:
   IndexSwiftASTWalker(IndexDataConsumer &IdxConsumer, ASTContext &Ctx,
                       SourceFile *SF = nullptr)
       : IdxConsumer(IdxConsumer), SrcMgr(Ctx.SourceMgr),
-        BufferID(SF ? SF->getBufferID() : -1),
+        BufferID(SF ? std::optional(SF->getBufferID()) : std::nullopt),
         enableWarnings(IdxConsumer.enableWarnings()) {}
 
   ~IndexSwiftASTWalker() override {
@@ -872,10 +877,10 @@ private:
     llvm_unreachable("Can't find the generic parameter in the extended type");
   }
 
-  bool visitDeclReference(ValueDecl *D, CharSourceRange Range,
-                          TypeDecl *CtorTyRef, ExtensionDecl *ExtTyRef, Type T,
+  bool visitDeclReference(ValueDecl *D, SourceRange Range, TypeDecl *CtorTyRef,
+                          ExtensionDecl *ExtTyRef, Type T,
                           ReferenceMetaData Data) override {
-    SourceLoc Loc = Range.getStart();
+    SourceLoc Loc = Range.Start;
 
     if (Loc.isInvalid() || isSuppressed(Loc))
       return true;
@@ -883,8 +888,13 @@ private:
     IndexSymbol Info;
 
     // Dig back to the original captured variable
-    if (auto *VD = dyn_cast<VarDecl>(D)) {
+    if (isa<VarDecl>(D)) {
       Info.originalDecl = firstDecl(D);
+      // When indexing locals is disabled, the reference to the original decl
+      // would be lost without overwriting the local symbol.
+      if (!IdxConsumer.indexLocals()) {
+        D = Info.originalDecl;
+      }
     }
 
     if (Data.isImplicit)
@@ -910,10 +920,21 @@ private:
     // report an occurrence of `foo` in `_foo` and '$foo').
     if (auto *VD = dyn_cast<VarDecl>(D)) {
       if (auto *Wrapped = VD->getOriginalWrappedProperty()) {
-        assert(Range.getByteLength() > 1 &&
-               (Range.str().front() == '_' || Range.str().front() == '$'));
-        auto AfterDollar = Loc.getAdvancedLoc(1);
-        reportRef(Wrapped, AfterDollar, Info, std::nullopt);
+        CharSourceRange CharRange = Lexer::getCharSourceRangeFromSourceRange(
+            D->getASTContext().SourceMgr, Range);
+        assert(CharRange.getByteLength() > 1);
+        if (CharRange.str().front() == '`') {
+          assert(CharRange.getByteLength() > 3);
+          assert(CharRange.str().starts_with("`_") ||
+                 CharRange.str().starts_with("`$"));
+          auto AfterBacktick = Loc.getAdvancedLoc(2);
+          reportRef(Wrapped, AfterBacktick, Info, std::nullopt);
+        } else {
+          assert(CharRange.str().front() == '_' ||
+                 CharRange.str().front() == '$');
+          auto AfterDollar = Loc.getAdvancedLoc(1);
+          reportRef(Wrapped, AfterDollar, Info, std::nullopt);
+        }
       }
     }
 
@@ -944,7 +965,7 @@ private:
     return finishSourceEntity(Info.symInfo, Info.roles);
   }
 
-  bool visitCallAsFunctionReference(ValueDecl *D, CharSourceRange Range,
+  bool visitCallAsFunctionReference(ValueDecl *D, SourceRange Range,
                                     ReferenceMetaData Data) override {
     // Index implicit callAsFunction reference.
     return visitDeclReference(D, Range, /*CtorTyRef*/ nullptr,
@@ -1066,21 +1087,23 @@ private:
   // \c None if \p loc is otherwise invalid or its original location isn't
   // contained within the current buffer.
   std::optional<MappedLoc> getMappedLocation(SourceLoc loc) {
-    if (loc.isInvalid()) {
+    if (loc.isInvalid() || !BufferID.has_value()) {
       if (IsModuleFile)
         return {{0, 0, false}};
       return std::nullopt;
     }
 
+    auto bufferID = BufferID.value();
     bool inGeneratedBuffer =
-        !SrcMgr.rangeContainsTokenLoc(SrcMgr.getRangeForBuffer(BufferID), loc);
+        !SrcMgr.rangeContainsTokenLoc(SrcMgr.getRangeForBuffer(bufferID), loc);
 
-    auto bufferID = BufferID;
     if (inGeneratedBuffer) {
-      std::tie(bufferID, loc) = CurrentModule->getOriginalLocation(loc);
-      if (BufferID != bufferID) {
-        assert(false && "Location is not within file being indexed");
-        return std::nullopt;
+      if (auto unexpandedRange = getUnexpandedMacroRange(SrcMgr, loc)) {
+        loc = unexpandedRange.Start;
+        if (bufferID != SrcMgr.findBufferContainingLoc(loc)) {
+          assert(false && "Location should be within file being indexed");
+          return std::nullopt;
+        }
       }
     }
 
@@ -2154,8 +2177,20 @@ void index::indexSourceFile(SourceFile *SF, IndexDataConsumer &consumer) {
 }
 
 void index::indexModule(ModuleDecl *module, IndexDataConsumer &consumer) {
+  PrettyStackTraceDecl trace("indexing module", module);
+  ASTContext &ctx = module->getASTContext();
   assert(module);
-  IndexSwiftASTWalker walker(consumer, module->getASTContext());
+
+  auto mName = module->getRealName().str();
+  if (ctx.blockListConfig.hasBlockListAction(mName,
+      BlockListKeyKind::ModuleName,
+      BlockListAction::SkipIndexingModule)) {
+    return;
+  }
+
+  llvm::SaveAndRestore<bool> S(ctx.ForceExtendedDeserializationRecovery, true);
+
+  IndexSwiftASTWalker walker(consumer, ctx);
   walker.visitModule(*module);
   consumer.finish();
 }

@@ -248,6 +248,12 @@ module WinSDK [system] {
     export *
   }
 
+  module DDE {
+    header "dde.h"
+    header "ddeml.h"
+    export *
+  }
+
   module DFS {
     header "LMDFS.h"
     header "LM.h"
@@ -285,6 +291,13 @@ module WinSDK [system] {
     }
   }
 
+  module LZ32 {
+    header "LZExpand.h"
+    export *
+
+    link "Lz32.Lib"
+  }
+
   module Multimedia {
     module DigitalVideo {
       header "Digitalv.h"
@@ -314,6 +327,11 @@ module WinSDK [system] {
     export *
 
     link "Mpr.Lib"
+  }
+
+  module NTAPI {
+    header "winternl.h"
+    export *
   }
 
   module Security {
@@ -386,6 +404,11 @@ module WinSDK [system] {
       header "mcx.h"
       export *
     }
+  }
+
+  module OLE {
+    header "ole2.h"
+    export *
   }
 
   module OLE32 {

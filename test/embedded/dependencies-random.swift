@@ -1,5 +1,5 @@
 // RUN: %empty-directory(%t)
-// RUN: %target-swift-frontend -parse-as-library -enable-experimental-feature Embedded %s -c -o %t/a.o
+// RUN: %target-swift-frontend -parse-as-library -enable-experimental-feature Embedded -enable-experimental-feature Extern %s -c -o %t/a.o
 
 // RUN: grep DEP\: %s | sed 's#// DEP\: ##' | sort > %t/allowed-dependencies.txt
 
@@ -28,11 +28,10 @@
 // REQUIRES: swift_in_compiler
 // REQUIRES: executable_test
 // REQUIRES: optimized_stdlib
-// REQUIRES: OS=macosx || OS=linux-gnu
 // UNSUPPORTED: OS=linux-gnu && CPU=aarch64
 
-// REQUIRES: rdar121923818
 // REQUIRES: swift_feature_Embedded
+// REQUIRES: swift_feature_Extern
 
 @_extern(c, "putchar")
 @discardableResult

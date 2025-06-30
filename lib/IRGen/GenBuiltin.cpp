@@ -588,9 +588,7 @@ void irgen::emitBuiltinCall(IRGenFunction &IGF, const BuiltinInfo &Builtin,
   }
   
   if (Builtin.ID == BuiltinValueKind::FNeg) {
-    llvm::Value *rhs = args.claimNext();
-    llvm::Value *lhs = llvm::ConstantFP::get(rhs->getType(), "-0.0");
-    llvm::Value *v = IGF.Builder.CreateFSub(lhs, rhs);
+    llvm::Value *v = IGF.Builder.CreateFNeg(args.claimNext());
     return out.add(v);
   }
   if (Builtin.ID == BuiltinValueKind::AssumeTrue) {
@@ -899,6 +897,16 @@ void irgen::emitBuiltinCall(IRGenFunction &IGF, const BuiltinInfo &Builtin,
     return;
   }
   
+  if (Builtin.ID == BuiltinValueKind::Select) {
+    using namespace llvm;
+    
+    auto pred = args.claimNext();
+    auto ifTrue = args.claimNext();
+    auto ifFalse = args.claimNext();
+    out.add(IGF.Builder.CreateSelect(pred, ifTrue, ifFalse));
+    return;
+  }
+  
   if (Builtin.ID == BuiltinValueKind::ShuffleVector) {
     using namespace llvm;
 
@@ -906,6 +914,47 @@ void irgen::emitBuiltinCall(IRGenFunction &IGF, const BuiltinInfo &Builtin,
     auto dict1 = args.claimNext();
     auto index = args.claimNext();
     out.add(IGF.Builder.CreateShuffleVector(dict0, dict1, index));
+    return;
+  }
+  
+  if (Builtin.ID == BuiltinValueKind::Interleave) {
+    using namespace llvm;
+    
+    auto src0 = args.claimNext();
+    auto src1 = args.claimNext();
+    
+    int n = Builtin.Types[0]->getAs<BuiltinVectorType>()->getNumElements();
+    SmallVector<int> shuffleLo(n);
+    SmallVector<int> shuffleHi(n);
+    for (int i=0; i<n/2; ++i) {
+      shuffleLo[2*i] = i;
+      shuffleHi[2*i] = n/2 + i;
+      shuffleLo[2*i+1] = n + i;
+      shuffleHi[2*i+1] = 3*n/2 + i;
+    }
+    
+    out.add(IGF.Builder.CreateShuffleVector(src0, src1, shuffleLo));
+    out.add(IGF.Builder.CreateShuffleVector(src0, src1, shuffleHi));
+    return;
+  }
+  
+  
+  if (Builtin.ID == BuiltinValueKind::Deinterleave) {
+    using namespace llvm;
+    
+    auto src0 = args.claimNext();
+    auto src1 = args.claimNext();
+    
+    int n = Builtin.Types[0]->getAs<BuiltinVectorType>()->getNumElements();
+    SmallVector<int> shuffleEven(n);
+    SmallVector<int> shuffleOdd(n);
+    for (int i=0; i<n; ++i) {
+      shuffleEven[i] = 2*i;
+      shuffleOdd[i]  = 2*i + 1;
+    }
+    
+    out.add(IGF.Builder.CreateShuffleVector(src0, src1, shuffleEven));
+    out.add(IGF.Builder.CreateShuffleVector(src0, src1, shuffleOdd));
     return;
   }
 
@@ -1327,25 +1376,31 @@ void irgen::emitBuiltinCall(IRGenFunction &IGF, const BuiltinInfo &Builtin,
   }
   
   if (Builtin.ID == BuiltinValueKind::ZeroInitializer) {
-    // Build a zero initializer of the result type.
-    auto valueTy = getLoweredTypeAndTypeInfo(IGF.IGM,
-                                             substitutions.getReplacementTypes()[0]);
-    
     if (args.size() > 0) {
+      auto valueType = argTypes[0];
+      auto &valueTI = IGF.IGM.getTypeInfo(valueType);
+
       // `memset` the memory addressed by the argument.
       auto address = args.claimNext();
-      IGF.Builder.CreateMemSet(valueTy.second.getAddressForPointer(address),
+      IGF.Builder.CreateMemSet(valueTI.getAddressForPointer(address),
                                llvm::ConstantInt::get(IGF.IGM.Int8Ty, 0),
-                               valueTy.second.getSize(IGF, argTypes[0]));
+                               valueTI.getSize(IGF, valueType));
     } else {
-      auto schema = valueTy.second.getSchema();
+      auto &resultTI = cast<LoadableTypeInfo>(IGF.IGM.getTypeInfo(resultType));
+      auto schema = resultTI.getSchema();
       for (auto &elt : schema) {
         out.add(llvm::Constant::getNullValue(elt.getScalarType()));
       }
     }
     return;
   }
-  
+
+  if (Builtin.ID == BuiltinValueKind::PrepareInitialization) {
+    ASSERT(args.size() > 0 && "only address-variant of prepareInitialization is supported");
+    (void)args.claimNext();
+    return;
+  }
+
   if (Builtin.ID == BuiltinValueKind::GetObjCTypeEncoding) {
     (void)args.claimAll();
     Type valueTy = substitutions.getReplacementTypes()[0];
@@ -1476,8 +1531,10 @@ void irgen::emitBuiltinCall(IRGenFunction &IGF, const BuiltinInfo &Builtin,
   }
 
   if (Builtin.ID == BuiltinValueKind::AllocVector) {
+    // Obsolete: only there to be able to read old Swift.interface files which still
+    // contain the builtin.
     (void)args.claimAll();
-    IGF.emitTrap("escaped vector allocation", /*EmitUnreachable=*/true);
+    IGF.emitTrap("vector allocation not supported anymore", /*EmitUnreachable=*/true);
     out.add(llvm::UndefValue::get(IGF.IGM.Int8PtrTy));
     llvm::BasicBlock *contBB = llvm::BasicBlock::Create(IGF.IGM.getLLVMContext());
     IGF.Builder.emitBlock(contBB);

@@ -95,6 +95,12 @@ void SplitterStep::computeFollowupSteps(
   // Contract the edges of the constraint graph.
   CG.optimize();
 
+  if (CS.getASTContext().TypeCheckerOpts.SolverDisableSplitter) {
+    steps.push_back(std::make_unique<ComponentStep>(
+          CS, 0, &CS.InactiveConstraints, Solutions));
+    return;
+  }
+
   // Compute the connected components of the constraint graph.
   auto components = CG.computeConnectedComponents(CS.getTypeVariables());
   unsigned numComponents = components.size();
@@ -266,7 +272,7 @@ StepResult ComponentStep::take(bool prevFailed) {
     }
   });
 
-  auto disjunction = CS.selectDisjunction();
+  auto *disjunction = CS.selectDisjunction();
   auto *conjunction = CS.selectConjunction();
 
   if (CS.isDebugMode()) {
@@ -309,8 +315,7 @@ StepResult ComponentStep::take(bool prevFailed) {
     // Bindings usually happen first, but sometimes we want to prioritize a
     // disjunction or conjunction.
     if (bestBindings) {
-      if (disjunction &&
-          !bestBindings->favoredOverDisjunction(disjunction->first))
+      if (disjunction && !bestBindings->favoredOverDisjunction(disjunction))
         return StepKind::Disjunction;
 
       if (conjunction && !bestBindings->favoredOverConjunction(conjunction))
@@ -333,9 +338,9 @@ StepResult ComponentStep::take(bool prevFailed) {
       return suspend(
           std::make_unique<TypeVariableStep>(*bestBindings, Solutions));
     case StepKind::Disjunction: {
-      CS.retireConstraint(disjunction->first);
+      CS.retireConstraint(disjunction);
       return suspend(
-          std::make_unique<DisjunctionStep>(CS, *disjunction, Solutions));
+          std::make_unique<DisjunctionStep>(CS, disjunction, Solutions));
     }
     case StepKind::Conjunction: {
       CS.retireConstraint(conjunction);
@@ -633,9 +638,6 @@ bool DisjunctionStep::shouldSkip(const DisjunctionChoice &choice) const {
   if (choice.isUnavailable() && !CS.shouldAttemptFixes())
     return skip("unavailable");
 
-  if (ctx.TypeCheckerOpts.DisableConstraintSolverPerformanceHacks)
-    return false;
-
   // If the solver already found a solution with a better overload choice that
   // can be unconditionally substituted by the current choice, skip the current
   // choice.
@@ -721,14 +723,9 @@ bool swift::isSIMDOperator(ValueDecl *value) {
 
 bool DisjunctionStep::shortCircuitDisjunctionAt(
     Constraint *currentChoice, Constraint *lastSuccessfulChoice) const {
-  auto &ctx = CS.getASTContext();
-
   // Anything without a fix is better than anything with a fix.
   if (currentChoice->getFix() && !lastSuccessfulChoice->getFix())
     return true;
-
-  if (ctx.TypeCheckerOpts.DisableConstraintSolverPerformanceHacks)
-    return false;
 
   if (auto restriction = currentChoice->getRestriction()) {
     // Non-optional conversions are better than optional-to-optional

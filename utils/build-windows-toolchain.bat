@@ -60,13 +60,17 @@ set TMPDIR=%BuildRoot%\tmp
 set NINJA_STATUS=[%%f/%%t][%%p][%%es] 
 
 :: Build the -Test argument, if any, by subtracting skipped tests
-set TestArg=-Test lld,swift,dispatch,foundation,xctest,swift-format,sourcekit-lsp,
+set TestArg=-Test lld,lldb,swift,dispatch,foundation,xctest,swift-format,sourcekit-lsp,
 for %%I in (%SKIP_TESTS%) do (call set TestArg=%%TestArg:%%I,=%%)
 if "%TestArg:~-1%"=="," (set TestArg=%TestArg:~0,-1%) else (set TestArg= )
 
 :: Build the -SkipPackaging argument, if any
 set SkipPackagingArg=-SkipPackaging
 if not "%SKIP_PACKAGING%"=="1" set "SkipPackagingArg= "
+
+:: Build the -WindowsSDKs argument, if any, otherwise build all the SDKs.
+set "WindowsSDKsArg= "
+if not "%WINDOWS_SDKS%"=="" set "WindowsSDKsArg=-WindowsSDKs %WINDOWS_SDKS%"
 
 call :CloneRepositories || (exit /b 1)
 
@@ -76,6 +80,7 @@ powershell.exe -ExecutionPolicy RemoteSigned -File %~dp0build.ps1 ^
   -BinaryCache %BuildRoot% ^
   -ImageRoot %BuildRoot% ^
   %SkipPackagingArg% ^
+  %WindowsSDKsArg% ^
   %TestArg% ^
   -Stage %PackageRoot% ^
   -Summary || (exit /b 1)
@@ -105,7 +110,6 @@ set "args=%args% --skip-repository swift"
 set "args=%args% --skip-repository ninja"
 set "args=%args% --skip-repository swift-integration-tests"
 set "args=%args% --skip-repository swift-stress-tester"
-set "args=%args% --skip-repository swift-xcode-playground-support"
 
 call "%SourceRoot%\swift\utils\update-checkout.cmd" %args% --clone --skip-history --reset-to-remote --github-comment "%ghprbCommentBody%"
 

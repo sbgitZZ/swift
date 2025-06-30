@@ -185,6 +185,11 @@ private:
   /// \p selfTy must be a \c Self type of the context.
   static bool canBeUsedAsRequirementFirstType(Type selfTy, TypeAliasDecl *TAD);
 
+  /// Retrieve the type to use as the base for a member completion.
+  Type getMemberBaseType() const {
+    return BaseType ? BaseType : ExprType;
+  }
+
 public:
   struct RequestedResultsTy {
     const ModuleDecl *TheModule;
@@ -320,6 +325,8 @@ public:
 
   void addImportModuleNames();
 
+  void addUsingSpecifiers();
+
   SemanticContextKind getSemanticContext(const Decl *D,
                                          DeclVisibilityKind Reason,
                                          DynamicLookupInfo dynamicLookupInfo);
@@ -334,6 +341,8 @@ public:
 
   void addValueBaseName(CodeCompletionResultBuilder &Builder,
                         DeclBaseName Name);
+
+  void addIdentifier(CodeCompletionResultBuilder &Builder, Identifier Name);
 
   void addLeadingDot(CodeCompletionResultBuilder &Builder);
 
@@ -428,6 +437,9 @@ public:
   void addNominalTypeRef(const NominalTypeDecl *NTD, DeclVisibilityKind Reason,
                          DynamicLookupInfo dynamicLookupInfo);
 
+  Type getTypeAliasType(const TypeAliasDecl *TAD,
+                        DynamicLookupInfo dynamicLookupInfo);
+
   void addTypeAliasRef(const TypeAliasDecl *TAD, DeclVisibilityKind Reason,
                        DynamicLookupInfo dynamicLookupInfo);
 
@@ -448,6 +460,8 @@ public:
   void addEnumElementRef(const EnumElementDecl *EED, DeclVisibilityKind Reason,
                          DynamicLookupInfo dynamicLookupInfo,
                          bool HasTypeContext);
+  void addMacroCallArguments(const MacroDecl *MD, DeclVisibilityKind Reason,
+                             bool forTrivialTrailingClosure = false);
   void addMacroExpansion(const MacroDecl *MD, DeclVisibilityKind Reason);
 
   void addKeyword(
@@ -605,7 +619,7 @@ public:
 
   void getAttributeDeclCompletions(bool IsInSil, std::optional<DeclKind> DK);
 
-  void getAttributeDeclParamCompletions(CustomSyntaxAttributeKind AttrKind,
+  void getAttributeDeclParamCompletions(ParameterizedDeclAttributeKind AttrKind,
                                         int ParamIndex, bool HasLabel);
 
   void getTypeAttributeKeywordCompletions(CompletionKind completionKind);

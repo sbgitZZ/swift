@@ -17,10 +17,12 @@
 #include "TypeCheckAccess.h"
 #include "TypeAccessScopeChecker.h"
 #include "TypeCheckAvailability.h"
+#include "TypeCheckUnsafe.h"
 #include "TypeChecker.h"
 #include "swift/AST/ASTVisitor.h"
 #include "swift/AST/ASTWalker.h"
 #include "swift/AST/ClangModuleLoader.h"
+#include "swift/AST/DeclExportabilityVisitor.h"
 #include "swift/AST/DiagnosticsSema.h"
 #include "swift/AST/ExistentialLayout.h"
 #include "swift/AST/Import.h"
@@ -497,7 +499,7 @@ void AccessControlCheckerBase::checkGenericParamAccess(
     if (downgradeToWarning == DowngradeToWarning::Yes)
       diagID = diag::generic_param_usable_from_inline_warn;
     auto diag =
-        Context.Diags.diagnose(ownerDecl, diagID, ownerDecl->getDescriptiveKind(),
+        Context.Diags.diagnose(ownerDecl, diagID, ownerDecl,
                                accessControlErrorKind == ACEK::Requirement);
     highlightOffendingType(diag, complainRepr);
     noteLimitingImport(/*userDecl*/nullptr, Context, minImportLimit, complainRepr);
@@ -513,9 +515,8 @@ void AccessControlCheckerBase::checkGenericParamAccess(
   if (downgradeToWarning == DowngradeToWarning::Yes)
     diagID = diag::generic_param_access_warn;
   auto diag = Context.Diags.diagnose(
-      ownerDecl, diagID, ownerDecl->getDescriptiveKind(), isExplicit,
-      contextAccess, minAccess, isa<FileUnit>(DC),
-      accessControlErrorKind == ACEK::Requirement);
+      ownerDecl, diagID, ownerDecl, isExplicit, contextAccess, minAccess,
+      isa<FileUnit>(DC), accessControlErrorKind == ACEK::Requirement);
   highlightOffendingType(diag, complainRepr);
   noteLimitingImport(/*userDecl*/nullptr, Context, minImportLimit, complainRepr);
 }
@@ -599,8 +600,8 @@ public:
   UNREACHABLE(Operator, "cannot appear in a type context")
   UNREACHABLE(PrecedenceGroup, "cannot appear in a type context")
   UNREACHABLE(Module, "cannot appear in a type context")
+  UNREACHABLE(Using, "cannot appear in a type context")
 
-  UNREACHABLE(PoundDiagnostic, "does not have access control")
   UNREACHABLE(Param, "does not have access control")
   UNREACHABLE(GenericTypeParam, "does not have access control")
   UNREACHABLE(Missing, "does not have access control")
@@ -1380,6 +1381,7 @@ public:
   UNREACHABLE(Operator, "cannot appear in a type context")
   UNREACHABLE(PrecedenceGroup, "cannot appear in a type context")
   UNREACHABLE(Module, "cannot appear in a type context")
+  UNREACHABLE(Using, "cannot appear in a type context")
 
   UNREACHABLE(Param, "does not have access control")
   UNREACHABLE(GenericTypeParam, "does not have access control")
@@ -1387,12 +1389,12 @@ public:
   UNREACHABLE(MissingMember, "does not have access control")
   UNREACHABLE(MacroExpansion, "does not have access control")
   UNREACHABLE(BuiltinTuple, "BuiltinTupleDecl should not show up here")
+
 #undef UNREACHABLE
 
 #define UNINTERESTING(KIND) \
   void visit##KIND##Decl(KIND##Decl *D) {}
 
-  UNINTERESTING(PoundDiagnostic) // Does not have access control.
   UNINTERESTING(EnumCase) // Handled at the EnumElement level.
   UNINTERESTING(Var) // Handled at the PatternBinding level.
   UNINTERESTING(Destructor) // Always correct.
@@ -1905,6 +1907,8 @@ bool isFragileClangDecl(const clang::Decl *decl) {
     return isFragileClangType(pd->getType());
   if (auto *typedefDecl = dyn_cast<clang::TypedefNameDecl>(decl))
     return isFragileClangType(typedefDecl->getUnderlyingType());
+  if (auto *enumDecl = dyn_cast<clang::EnumDecl>(decl))
+    return enumDecl->isScoped();
   if (auto *rd = dyn_cast<clang::RecordDecl>(decl)) {
     auto cxxRecordDecl = dyn_cast<clang::CXXRecordDecl>(rd);
     if (!cxxRecordDecl)
@@ -2016,7 +2020,7 @@ swift::getDisallowedOriginKind(const Decl *decl,
       // Decls with @_spi_available aren't hidden entirely from public interfaces,
       // thus public interfaces may still refer them. Be forgiving here so public
       // interfaces can compile.
-      if (where.getUnavailablePlatformKind().has_value())
+      if (where.getAvailability().isUnavailable())
         return DisallowedOriginKind::None;
       // We should only diagnose SPI_AVAILABLE usage when the library level is API.
       // Using SPI_AVAILABLE symbols in private frameworks or executable targets
@@ -2110,7 +2114,9 @@ class DeclAvailabilityChecker : public DeclVisitor<DeclAvailabilityChecker> {
           continue;
         assert(inheritedEntries.size() == 1);
         auto inherited = inheritedEntries.front();
-        checkType(inherited.getType(), inherited.getTypeRepr(), ownerDecl);
+        checkType(inherited.getType(), inherited.getTypeRepr(), ownerDecl,
+                  ExportabilityReason::General,
+                  DeclAvailabilityFlag::DisableUnsafeChecking);
       }
     }
 
@@ -2125,7 +2131,9 @@ class DeclAvailabilityChecker : public DeclVisitor<DeclAvailabilityChecker> {
       forAllRequirementTypes(WhereClauseOwner(
                                const_cast<GenericContext *>(ownerCtx)),
                              [&](Type type, TypeRepr *typeRepr) {
-        checkType(type, typeRepr, ownerDecl);
+        checkType(type, typeRepr, ownerDecl,
+                  ExportabilityReason::General,
+                  DeclAvailabilityFlag::DisableUnsafeChecking);
       });
     }
   }
@@ -2165,6 +2173,7 @@ public:
   UNREACHABLE(TopLevelCode, "not applicable")
   UNREACHABLE(Module, "not applicable")
   UNREACHABLE(Missing, "not applicable")
+  UNREACHABLE(Using, "not applicable")
 
   UNREACHABLE(Param, "handled by the enclosing declaration")
   UNREACHABLE(GenericTypeParam, "handled by the enclosing declaration")
@@ -2177,7 +2186,6 @@ public:
 
   UNINTERESTING(PrefixOperator) // Does not reference other decls.
   UNINTERESTING(PostfixOperator) // Does not reference other decls.
-  UNINTERESTING(PoundDiagnostic) // Not applicable.
   UNINTERESTING(EnumCase) // Handled at the EnumElement level.
   UNINTERESTING(Destructor) // Always correct.
   UNINTERESTING(Accessor) // Handled by the Var or Subscript.
@@ -2272,7 +2280,9 @@ public:
     if (assocType->getTrailingWhereClause()) {
       forAllRequirementTypes(assocType,
                              [&](Type type, TypeRepr *typeRepr) {
-        checkType(type, typeRepr, assocType);
+        checkType(type, typeRepr, assocType,
+                  ExportabilityReason::General,
+                  DeclAvailabilityFlag::DisableUnsafeChecking);
       });
     }
   }
@@ -2298,19 +2308,22 @@ public:
 
     for (TypeLoc inherited : nominal->getInherited().getEntries()) {
       checkType(inherited.getType(), inherited.getTypeRepr(), nominal,
-                ExportabilityReason::Inheritance, flags);
+                ExportabilityReason::Inheritance,
+                flags | DeclAvailabilityFlag::DisableUnsafeChecking);
     }
   }
 
   void visitProtocolDecl(ProtocolDecl *proto) {
     for (TypeLoc requirement : proto->getInherited().getEntries()) {
       checkType(requirement.getType(), requirement.getTypeRepr(), proto,
-                ExportabilityReason::General);
+                ExportabilityReason::General,
+                DeclAvailabilityFlag::DisableUnsafeChecking);
     }
 
     if (proto->getTrailingWhereClause()) {
       forAllRequirementTypes(proto, [&](Type type, TypeRepr *typeRepr) {
-        checkType(type, typeRepr, proto);
+        checkType(type, typeRepr, proto, ExportabilityReason::General,
+                  DeclAvailabilityFlag::DisableUnsafeChecking);
       });
     }
   }
@@ -2384,7 +2397,8 @@ public:
                            : ExportabilityReason::ExtensionWithConditionalConformances;
 
     forAllRequirementTypes(ED, [&](Type type, TypeRepr *typeRepr) {
-      checkType(type, typeRepr, ED, reason);
+      checkType(type, typeRepr, ED, reason,
+                DeclAvailabilityFlag::DisableUnsafeChecking);
     });
   }
 
@@ -2398,10 +2412,11 @@ public:
     //
     // 1) If the extension defines conformances, the conformed-to protocols
     // must be exported.
+    DeclAvailabilityFlags flags = DeclAvailabilityFlag::AllowPotentiallyUnavailableProtocol;
+    flags |= DeclAvailabilityFlag::DisableUnsafeChecking;
     for (TypeLoc inherited : ED->getInherited().getEntries()) {
       checkType(inherited.getType(), inherited.getTypeRepr(), ED,
-                ExportabilityReason::Inheritance,
-                DeclAvailabilityFlag::AllowPotentiallyUnavailableProtocol);
+                ExportabilityReason::Inheritance, flags);
     }
 
     auto wasWhere = Where;

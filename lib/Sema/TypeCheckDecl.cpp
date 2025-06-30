@@ -2,7 +2,7 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2018 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2025 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
 // See https://swift.org/LICENSE.txt for license information
@@ -16,7 +16,7 @@
 
 #include "TypeCheckDecl.h"
 #include "CodeSynthesis.h"
-#include "DerivedConformances.h"
+#include "DerivedConformance/DerivedConformance.h"
 #include "MiscDiagnostics.h"
 #include "TypeCheckAccess.h"
 #include "TypeCheckAvailability.h"
@@ -938,6 +938,11 @@ IsStaticRequest::evaluate(Evaluator &evaluator, FuncDecl *decl) const {
 
 bool
 IsDynamicRequest::evaluate(Evaluator &evaluator, ValueDecl *decl) const {
+  // ABI-only decls get this from their API decl.
+  auto abiRole = ABIRoleInfo(decl);
+  if (!abiRole.providesAPI() && abiRole.getCounterpart())
+    return abiRole.getCounterpart()->isDynamic();
+
   // If we can't infer dynamic here, don't.
   if (!DeclAttribute::canAttributeAppearOnDecl(DeclAttrKind::Dynamic, decl))
     return false;
@@ -1201,8 +1206,7 @@ EnumRawValuesRequest::evaluate(Evaluator &eval, EnumDecl *ED,
   // values are intentionally omitted from them (unless the enum is @objc).
   // Without bailing here, incorrect raw values can be automatically generated
   // and incorrect diagnostics may be omitted for some decls.
-  SourceFile *Parent = ED->getDeclContext()->getParentSourceFile();
-  if (Parent && Parent->Kind == SourceFileKind::Interface && !ED->isObjC())
+  if (ED->getDeclContext()->isInSwiftinterface() && !ED->isObjC())
     return std::make_tuple<>();
 
   if (!computeAutomaticEnumValueKind(ED)) {
@@ -1300,15 +1304,6 @@ EnumRawValuesRequest::evaluate(Evaluator &eval, EnumDecl *ED,
     SourceLoc diagLoc = uncheckedRawValueOf(elt)->isImplicit()
                             ? elt->getLoc()
                             : uncheckedRawValueOf(elt)->getLoc();
-    if (auto magicLiteralExpr =
-            dyn_cast<MagicIdentifierLiteralExpr>(prevValue)) {
-      auto kindString =
-          magicLiteralExpr->getKindString(magicLiteralExpr->getKind());
-      Diags.diagnose(diagLoc, diag::enum_raw_value_magic_literal, kindString);
-      elt->setInvalid();
-      continue;
-    }
-
     // Check that the raw value is unique.
     RawValueKey key{prevValue};
     RawValueSource source{elt, lastExplicitValueElt};
@@ -1689,6 +1684,14 @@ bool TypeChecker::isAvailabilitySafeForConformance(
   assert(dc->getSelfNominalTypeDecl() &&
          "Must have a nominal or extension context");
 
+  auto contextForConformingDecl =
+      AvailabilityContext::forDeclSignature(dc->getAsDecl());
+
+  // If the conformance is unavailable then it's irrelevant whether the witness
+  // is potentially unavailable.
+  if (contextForConformingDecl.isUnavailable())
+    return true;
+
   // Make sure that any access of the witness through the protocol
   // can only occur when the witness is available. That is, make sure that
   // on every version where the conforming declaration is available, if the
@@ -1704,7 +1707,7 @@ bool TypeChecker::isAvailabilitySafeForConformance(
   requirementInfo = AvailabilityInference::availableRange(requirement);
 
   AvailabilityRange infoForConformingDecl =
-      overApproximateAvailabilityAtLocation(dc->getAsDecl()->getLoc(), dc);
+      contextForConformingDecl.getPlatformRange();
 
   // Relax the requirements for @_spi witnesses by treating the requirement as
   // if it were introduced at the deployment target. This is not strictly sound
@@ -1725,7 +1728,7 @@ bool TypeChecker::isAvailabilitySafeForConformance(
   requirementInfo.constrainWith(infoForConformingDecl);
 
   AvailabilityRange infoForProtocolDecl =
-      overApproximateAvailabilityAtLocation(proto->getLoc(), proto);
+      AvailabilityContext::forDeclSignature(proto).getPlatformRange();
 
   witnessInfo.constrainWith(infoForProtocolDecl);
   requirementInfo.constrainWith(infoForProtocolDecl);
@@ -2235,8 +2238,21 @@ ParamSpecifierRequest::evaluate(Evaluator &evaluator,
   }
 
   auto typeRepr = param->getTypeRepr();
-  assert(typeRepr != nullptr && "Should call setSpecifier() on "
-         "synthesized parameter declarations");
+
+  if (!typeRepr) {
+    if (!param->isImplicit()) {
+      // Untyped closure parameter.
+      return ParamSpecifier::Default;
+    }
+
+    if (param->isInvalid()) {
+      // Invalid parse.
+      return ParamSpecifier::Default;
+    }
+
+    ASSERT(false && "Should call setSpecifier() on "
+           "synthesized parameter declarations");
+  }
 
   // Look through top-level pack expansions.  These specifiers are
   // part of what's repeated.
@@ -2252,6 +2268,10 @@ ParamSpecifierRequest::evaluate(Evaluator &evaluator,
 
   if (auto *lifetime = dyn_cast<LifetimeDependentTypeRepr>(nestedRepr)) {
     nestedRepr = lifetime->getBase();
+  }
+
+  if (auto callerIsolated = dyn_cast<CallerIsolatedTypeRepr>(nestedRepr)) {
+    nestedRepr = callerIsolated->getBase();
   }
 
   if (auto sending = dyn_cast<SendingTypeRepr>(nestedRepr)) {
@@ -2276,7 +2296,7 @@ ParamSpecifierRequest::evaluate(Evaluator &evaluator,
     }
     return ownershipRepr->getSpecifier();
   }
-  
+
   return ParamSpecifier::Default;
 }
 
@@ -2349,7 +2369,7 @@ static Type validateParameterType(ParamDecl *decl) {
                                    PlaceholderType::get,
                                    /*packElementOpener*/ nullptr);
 
-  if (auto *varargTypeRepr = dyn_cast<VarargTypeRepr>(nestedRepr)) {
+  if (isa<VarargTypeRepr>(nestedRepr)) {
     Ty = resolution.resolveType(nestedRepr);
 
     // Monovariadic types (T...) for <T> resolve to [T].
@@ -2387,6 +2407,13 @@ static void maybeAddParameterIsolation(AnyFunctionType::ExtInfoBuilder &infoBuil
     infoBuilder = infoBuilder.withIsolation(FunctionTypeIsolation::forParameter());
 }
 
+std::optional<llvm::ArrayRef<LifetimeDependenceInfo>>
+getLifetimeDependencies(ASTContext &context, EnumElementDecl *enumElemDecl) {
+  return evaluateOrDefault(context.evaluator,
+                           LifetimeDependenceInfoRequest{enumElemDecl},
+                           std::nullopt);
+}
+
 Type
 InterfaceTypeRequest::evaluate(Evaluator &eval, ValueDecl *D) const {
   auto &Context = D->getASTContext();
@@ -2403,12 +2430,12 @@ InterfaceTypeRequest::evaluate(Evaluator &eval, ValueDecl *D) const {
   case DeclKind::PrefixOperator:
   case DeclKind::PostfixOperator:
   case DeclKind::PrecedenceGroup:
-  case DeclKind::PoundDiagnostic:
   case DeclKind::Missing:
   case DeclKind::MissingMember:
   case DeclKind::Module:
   case DeclKind::OpaqueType:
   case DeclKind::MacroExpansion:
+  case DeclKind::Using:
     llvm_unreachable("should not get here");
     return Type();
 
@@ -2546,7 +2573,7 @@ InterfaceTypeRequest::evaluate(Evaluator &eval, ValueDecl *D) const {
     if (thrownTy) {
       thrownTy = AFD->getThrownInterfaceType();
       ProtocolDecl *errorProto = Context.getErrorDecl();
-      if (thrownTy && errorProto) {
+      if (thrownTy && !thrownTy->hasError() && errorProto) {
         Type thrownTyInContext = AFD->mapTypeIntoContext(thrownTy);
         if (!checkConformance(thrownTyInContext, errorProto)) {
           SourceLoc loc;
@@ -2591,7 +2618,8 @@ InterfaceTypeRequest::evaluate(Evaluator &eval, ValueDecl *D) const {
           infoBuilder = infoBuilder.withSendingResult();
       }
 
-      if (lifetimeDependenceInfo.has_value()) {
+      // Lifetime dependencies only apply to the outer function type.
+      if (!hasSelf && lifetimeDependenceInfo.has_value()) {
         infoBuilder =
             infoBuilder.withLifetimeDependencies(*lifetimeDependenceInfo);
       }
@@ -2639,6 +2667,10 @@ InterfaceTypeRequest::evaluate(Evaluator &eval, ValueDecl *D) const {
     AnyFunctionType::ExtInfoBuilder infoBuilder;
     maybeAddParameterIsolation(infoBuilder, argTy);
 
+    if (auto typeRepr = SD->getElementTypeRepr())
+      if (isa<SendingTypeRepr>(typeRepr))
+        infoBuilder = infoBuilder.withSendingResult();
+
     Type funcTy;
     // FIXME: Verify ExtInfo state is correct, not working by accident.
     auto info = infoBuilder.build();
@@ -2671,13 +2703,25 @@ InterfaceTypeRequest::evaluate(Evaluator &eval, ValueDecl *D) const {
       resultTy = FunctionType::get(argTy, resultTy, info);
     }
 
+    auto lifetimeDependenceInfo = getLifetimeDependencies(Context, EED);
+
     // FIXME: Verify ExtInfo state is correct, not working by accident.
     if (auto genericSig = ED->getGenericSignature()) {
-      GenericFunctionType::ExtInfo info;
-      resultTy = GenericFunctionType::get(genericSig, {selfTy}, resultTy, info);
+      GenericFunctionType::ExtInfoBuilder infoBuilder;
+      if (lifetimeDependenceInfo.has_value()) {
+        infoBuilder =
+            infoBuilder.withLifetimeDependencies(*lifetimeDependenceInfo);
+      }
+      resultTy = GenericFunctionType::get(genericSig, {selfTy}, resultTy,
+                                          infoBuilder.build());
+
     } else {
-      FunctionType::ExtInfo info;
-      resultTy = FunctionType::get({selfTy}, resultTy, info);
+      FunctionType::ExtInfoBuilder infoBuilder;
+      if (lifetimeDependenceInfo.has_value()) {
+        infoBuilder =
+            infoBuilder.withLifetimeDependencies(*lifetimeDependenceInfo);
+      }
+      resultTy = FunctionType::get({selfTy}, resultTy, infoBuilder.build());
     }
 
     return resultTy;
@@ -2907,7 +2951,7 @@ static ArrayRef<Decl *> evaluateMembersRequest(
     }
   }
 
-  if (nominal) {
+  if (nominal && !isa<ProtocolDecl>(nominal)) {
     // If the type conforms to Encodable or Decodable, even via an extension,
     // the CodingKeys enum is synthesized as a member of the type itself.
     // Force it into existence.
@@ -3126,7 +3170,7 @@ ImplicitKnownProtocolConformanceRequest::evaluate(Evaluator &evaluator,
 
 std::optional<llvm::ArrayRef<LifetimeDependenceInfo>>
 LifetimeDependenceInfoRequest::evaluate(Evaluator &evaluator,
-                                        AbstractFunctionDecl *decl) const {
+                                        ValueDecl *decl) const {
   return LifetimeDependenceInfo::get(decl);
 }
 
@@ -3198,29 +3242,6 @@ SourceFile::getIfConfigClausesWithin(SourceRange outer) const {
         return SM.isBeforeInBuffer(loc, range.getStartLoc());
       });
   return llvm::ArrayRef(lower, upper - lower);
-}
-
-//----------------------------------------------------------------------------//
-// IsUnsafeRequest
-//----------------------------------------------------------------------------//
-
-bool IsUnsafeRequest::evaluate(Evaluator &evaluator, Decl *decl) const {
-  // If it's marked @unsafe, it's unsafe.
-  if (decl->getAttrs().hasAttribute<UnsafeAttr>())
-    return true;
-
-  // Inference: A member of an @unsafe type is also unsafe.
-  if (auto enclosingDC = decl->getDeclContext()) {
-    if (auto enclosingNominal = enclosingDC->getSelfNominalTypeDecl())
-      if (enclosingNominal->isUnsafe())
-        return true;
-
-    if (auto ext = dyn_cast<ExtensionDecl>(enclosingDC))
-      if (ext->getAttrs().hasAttribute<UnsafeAttr>())
-        return true;
-  }
-
-  return false;
 }
 
 //----------------------------------------------------------------------------//

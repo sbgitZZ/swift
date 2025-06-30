@@ -13,6 +13,7 @@
 #include "swift/AST/ASTBridging.h"
 
 #include "swift/AST/ASTContext.h"
+#include "swift/AST/AvailabilitySpec.h"
 
 using namespace swift;
 
@@ -25,13 +26,18 @@ BridgedIdentifier BridgedASTContext_getIdentifier(BridgedASTContext cContext,
   return cContext.unbridged().getIdentifier(cStr.unbridged());
 }
 
+BridgedIdentifier
+BridgedASTContext_getDollarIdentifier(BridgedASTContext cContext, size_t idx) {
+  return cContext.unbridged().getDollarIdentifier(idx);
+}
+
 bool BridgedASTContext_langOptsHasFeature(BridgedASTContext cContext,
                                           BridgedFeature feature) {
   return cContext.unbridged().LangOpts.hasFeature((Feature)feature);
 }
 
-unsigned BridgedASTContext_majorLanguageVersion(BridgedASTContext cContext) {
-  return cContext.unbridged().LangOpts.EffectiveLanguageVersion[0];
+unsigned BridgedASTContext::getMajorLanguageVersion() const {
+  return unbridged().LangOpts.EffectiveLanguageVersion[0];
 }
 
 bool BridgedASTContext_langOptsCustomConditionSet(BridgedASTContext cContext,
@@ -84,18 +90,20 @@ bool BridgedASTContext_langOptsIsActiveTargetPtrAuth(BridgedASTContext cContext,
       PlatformConditionKind::PtrAuth, cName.unbridged());
 }
 
-unsigned
-BridgedASTContext_langOptsTargetPointerBitWidth(BridgedASTContext cContext) {
-  return cContext.unbridged().LangOpts.Target.isArch64Bit()   ? 64
-         : cContext.unbridged().LangOpts.Target.isArch32Bit() ? 32
-         : cContext.unbridged().LangOpts.Target.isArch16Bit() ? 16
-                                                              : 0;
+unsigned BridgedASTContext::getLangOptsTargetPointerBitWidth() const {
+  return unbridged().LangOpts.Target.isArch64Bit()   ? 64
+         : unbridged().LangOpts.Target.isArch32Bit() ? 32
+         : unbridged().LangOpts.Target.isArch16Bit() ? 16
+                                                     : 0;
 }
 
-BridgedEndianness
-BridgedASTContext_langOptsTargetEndianness(BridgedASTContext cContext) {
-  return cContext.unbridged().LangOpts.Target.isLittleEndian() ? EndianLittle
-                                                               : EndianBig;
+bool BridgedASTContext::getLangOptsAttachCommentsToDecls() const {
+  return unbridged().LangOpts.AttachCommentsToDecls;
+}
+
+BridgedEndianness BridgedASTContext::getLangOptsTargetEndianness() const {
+  return unbridged().LangOpts.Target.isLittleEndian() ? EndianLittle
+                                                      : EndianBig;
 }
 
 /// Convert an array of numbers into a form we can use in Swift.
@@ -166,4 +174,8 @@ bool BridgedASTContext_canImport(BridgedASTContext cContext,
   return cContext.unbridged().canImportModule(
       builder.get(), canImportLoc.unbridged(), version,
       versionKind == CanImportUnderlyingVersion);
+}
+
+BridgedAvailabilityMacroMap BridgedASTContext::getAvailabilityMacroMap() const {
+  return &unbridged().getAvailabilityMacroMap();
 }

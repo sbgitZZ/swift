@@ -27,9 +27,11 @@ add_swift_host_library(swiftAST STATIC
   Attr.cpp
   AutoDiff.cpp
   Availability.cpp
+  AvailabilityConstraint.cpp
   AvailabilityContext.cpp
   AvailabilityDomain.cpp
   AvailabilityScope.cpp
+  AvailabilityScopeBuilder.cpp
   AvailabilitySpec.cpp
   Builtins.cpp
   CaptureInfo.cpp
@@ -41,7 +43,9 @@ add_swift_host_library(swiftAST STATIC
   ConformanceLookupTable.cpp
   Decl.cpp
   DeclContext.cpp
+  DeclContextDumper.cpp
   DeclNameLoc.cpp
+  DiagnosticArgument.cpp
   DiagnosticBridge.cpp
   DiagnosticConsumer.cpp
   DiagnosticEngine.cpp
@@ -82,7 +86,7 @@ add_swift_host_library(swiftAST STATIC
   ParameterPack.cpp
   Parameter.cpp
   Pattern.cpp
-  PlatformKind.cpp
+  PlatformKindUtils.cpp
   PluginLoader.cpp
   PluginRegistry.cpp
   PrettyStackTrace.cpp
@@ -91,6 +95,7 @@ add_swift_host_library(swiftAST STATIC
   RawComment.cpp
   Requirement.cpp
   RequirementEnvironment.cpp
+  RequirementMachine/ApplyInverses.cpp
   RequirementMachine/ConcreteContraction.cpp
   RequirementMachine/ConcreteTypeWitness.cpp
   RequirementMachine/Diagnostics.cpp

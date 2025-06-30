@@ -74,17 +74,18 @@ setExpectedExecutorForParameterIsolation(SILGenFunction &SGF,
   // If we have caller isolation inheriting... just grab from our isolated
   // argument.
   if (actorIsolation.getKind() == ActorIsolation::CallerIsolationInheriting) {
-    if (auto *isolatedArg = SGF.F.maybeGetIsolatedArgument()) {
-      ManagedValue isolatedMV;
-      if (isolatedArg->getOwnershipKind() == OwnershipKind::Guaranteed) {
-        isolatedMV = ManagedValue::forBorrowedRValue(isolatedArg);
-      } else {
-        isolatedMV = ManagedValue::forUnmanagedOwnedValue(isolatedArg);
-      }
-
-      SGF.ExpectedExecutor.set(SGF.emitLoadActorExecutor(loc, isolatedMV));
-      return;
+    auto *isolatedArg = SGF.F.maybeGetIsolatedArgument();
+    assert(isolatedArg &&
+           "Caller Isolation Inheriting without isolated parameter");
+    ManagedValue isolatedMV;
+    if (isolatedArg->getOwnershipKind() == OwnershipKind::Guaranteed) {
+      isolatedMV = ManagedValue::forBorrowedRValue(isolatedArg);
+    } else {
+      isolatedMV = ManagedValue::forUnmanagedOwnedValue(isolatedArg);
     }
+
+    SGF.ExpectedExecutor.set(SGF.emitLoadActorExecutor(loc, isolatedMV));
+    return;
   }
 
   llvm_unreachable("Unhandled case?!");
@@ -154,7 +155,7 @@ void SILGenFunction::emitExpectedExecutorProlog() {
   }();
 
   // FIXME: Avoid loading and checking the expected executor if concurrency is
-  // unavailable. This is specifically relevant for MainActor isolated contexts,
+  // unavailable. This is specifically relevant for MainActor-isolated contexts,
   // which are allowed to be available on OSes where concurrency is not
   // available. rdar://106827064
 
@@ -194,7 +195,8 @@ void SILGenFunction::emitExpectedExecutorProlog() {
 
     case ActorIsolation::GlobalActor:
       if (F.isAsync() || wantDataRaceChecks) {
-        setExpectedExecutorForGlobalActor(*this, actorIsolation.getGlobalActor());
+        auto globalActorType = F.mapTypeIntoContext(actorIsolation.getGlobalActor());
+        setExpectedExecutorForGlobalActor(*this, globalActorType);
       }
       break;
     }
@@ -205,8 +207,12 @@ void SILGenFunction::emitExpectedExecutorProlog() {
     switch (actorIsolation.getKind()) {
     case ActorIsolation::Unspecified:
     case ActorIsolation::Nonisolated:
-    case ActorIsolation::CallerIsolationInheriting:
     case ActorIsolation::NonisolatedUnsafe:
+      break;
+
+    case ActorIsolation::CallerIsolationInheriting:
+      assert(F.isAsync());
+      setExpectedExecutorForParameterIsolation(*this, actorIsolation);
       break;
 
     case ActorIsolation::Erased:
@@ -221,7 +227,8 @@ void SILGenFunction::emitExpectedExecutorProlog() {
 
     case ActorIsolation::GlobalActor:
       if (wantExecutor) {
-        setExpectedExecutorForGlobalActor(*this, actorIsolation.getGlobalActor());
+        auto globalActorType = F.mapTypeIntoContext(actorIsolation.getGlobalActor());
+        setExpectedExecutorForGlobalActor(*this, globalActorType);
         break;
       }
     }
@@ -384,7 +391,7 @@ emitDistributedActorIsolation(SILGenFunction &SGF, SILLocation loc,
                               ManagedValue actor, CanType actorType) {
   // First, open the actor type if it's an existential type.
   if (actorType->isExistentialType()) {
-    CanType openedType = OpenedArchetypeType::getAny(actorType)
+    CanType openedType = ExistentialArchetypeType::getAny(actorType)
         ->getCanonicalType();
     SILType loweredOpenedType = SGF.getLoweredType(openedType);
 
@@ -397,7 +404,7 @@ emitDistributedActorIsolation(SILGenFunction &SGF, SILLocation loc,
   // Doing this manually is ill-advised in general, but this is such a
   // simple case that it's okay.
   auto distributedActorConf = getDistributedActorConformance(SGF, actorType);
-  auto sig = distributedActorConf.getRequirement()->getGenericSignature();
+  auto sig = distributedActorConf.getProtocol()->getGenericSignature();
   auto distributedActorSubs = SubstitutionMap::get(sig, {actorType},
                                                    {distributedActorConf});
 
@@ -523,7 +530,7 @@ SILGenFunction::emitFlowSensitiveSelfIsolation(SILLocation loc,
   SGM.useConformance(conformance);
 
   SubstitutionMap subs = SubstitutionMap::getProtocolSubstitutions(
-      conformance.getRequirement(), actorType, conformance);
+      conformance.getProtocol(), actorType, conformance);
   auto origActor =
     maybeEmitValueOfLocalVarDecl(isolatedVar, AccessKind::Read).getValue();
   SILType resultTy = SILType::getOpaqueIsolationType(ctx);
@@ -563,13 +570,15 @@ SILGenFunction::emitFunctionTypeIsolation(SILLocation loc,
 
   // Emit nonisolated by simply emitting Optional.none in the result type.
   case FunctionTypeIsolation::Kind::NonIsolated:
+  case FunctionTypeIsolation::Kind::NonIsolatedCaller:
     return emitNonIsolatedIsolation(loc);
 
   // Emit global actor isolation by loading .shared from the global actor,
   // erasing it into `any Actor`, and injecting that into Optional.
-  case FunctionTypeIsolation::Kind::GlobalActor:
+  case FunctionTypeIsolation::Kind::GlobalActor: {
     return emitGlobalActorIsolation(loc,
              isolation.getGlobalActorType()->getCanonicalType());
+  }
 
   // Emit @isolated(any) isolation by loading the actor reference from the
   // function.
@@ -640,14 +649,14 @@ SILGenFunction::emitClosureIsolation(SILLocation loc, SILDeclRef constant,
   case ActorIsolation::Erased:
     llvm_unreachable("closures cannot directly have erased isolation");
 
-  case ActorIsolation::GlobalActor:
-    return emitGlobalActorIsolation(loc,
-             isolation.getGlobalActor()->getCanonicalType());
+  case ActorIsolation::GlobalActor: {
+    auto globalActorType = F.mapTypeIntoContext(isolation.getGlobalActor())
+                               ->getCanonicalType();
+    return emitGlobalActorIsolation(loc, globalActorType);
+  }
 
   case ActorIsolation::ActorInstance: {
-    // This should always be a capture.  That's not expressed super-cleanly
-    // in ActorIsolation, unfortunately.
-    assert(isolation.getActorInstanceParameter() == 0);
+    assert(isolation.isActorInstanceForCapture());
     auto capture = isolation.getActorInstance();
     assert(capture);
     return emitLoadOfCaptureIsolation(*this, loc, capture, constant, captures);
@@ -699,8 +708,10 @@ SILGenFunction::emitExecutor(SILLocation loc, ActorIsolation isolation,
     return emitLoadActorExecutor(loc, self);
   }
 
-  case ActorIsolation::GlobalActor:
-    return emitLoadGlobalActorExecutor(isolation.getGlobalActor());
+  case ActorIsolation::GlobalActor: {
+    auto globalActorType = F.mapTypeIntoContext(isolation.getGlobalActor());
+    return emitLoadGlobalActorExecutor(globalActorType);
+  }
   }
   llvm_unreachable("covered switch");
 }

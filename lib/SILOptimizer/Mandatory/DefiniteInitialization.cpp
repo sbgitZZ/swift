@@ -1734,8 +1734,13 @@ void LifetimeChecker::handleInOutUse(const DIMemoryUse &Use) {
       return;
     }
 
-    auto diagID = diag::variable_inout_before_initialized;
-    
+    // A self argument implicitly passed as an inout parameter is diagnosed as
+    // "used before initialized", because "passed by reference" might be a
+    // confusing diagnostic in this context.
+    auto diagID = (Use.Kind == DIUseKind::InOutSelfArgument)
+                      ? diag::variable_used_before_initialized
+                      : diag::variable_inout_before_initialized;
+
     if (isa<AddressToPointerInst>(Use.Inst))
       diagID = diag::variable_addrtaken_before_initialized;
 
@@ -3869,6 +3874,9 @@ static void processMemoryObject(MarkUninitializedInst *I,
 /// properly set and transform the code as required for flow-sensitive
 /// properties.
 static bool checkDefiniteInitialization(SILFunction &Fn) {
+  FrontendStatsTracer StatsTracer(Fn.getModule().getASTContext().Stats,
+                                  "definite-init", &Fn);
+
   LLVM_DEBUG(llvm::dbgs() << "*** Definite Init visiting function: "
                           <<  Fn.getName() << "\n");
   bool Changed = false;

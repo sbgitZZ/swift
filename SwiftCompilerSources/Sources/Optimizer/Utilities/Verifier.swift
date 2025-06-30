@@ -96,6 +96,11 @@ private extension Phi {
 
 extension BorrowedFromInst : VerifiableInstruction {
   func verify(_ context: FunctionPassContext) {
+
+    for ev in enclosingValues {
+      require(ev.isValidEnclosingValueInBorrowedFrom, "invalid enclosing value in borrowed-from: \(ev)")
+    }
+
     var computedEVs = Stack<Value>(context)
     defer { computedEVs.deinitialize() }
 
@@ -114,6 +119,21 @@ extension BorrowedFromInst : VerifiableInstruction {
   }
 }
 
+private extension Value {
+  var isValidEnclosingValueInBorrowedFrom: Bool {
+    switch ownership {
+    case .owned:
+      return true
+    case .guaranteed:
+      return BeginBorrowValue(self) != nil ||
+             self is BorrowedFromInst ||
+             forwardingInstruction != nil
+    case .none, .unowned:
+      return false
+    }
+  }
+}
+
 extension LoadBorrowInst : VerifiableInstruction {
   func verify(_ context: FunctionPassContext) {
     if isUnchecked {
@@ -125,6 +145,16 @@ extension LoadBorrowInst : VerifiableInstruction {
 
     mutatingInstructions.findMutatingUses(of: self.address)
     mutatingInstructions.verifyNoMutatingUsesInLiverange(of: self)
+  }
+}
+
+extension VectorBaseAddrInst : VerifiableInstruction {
+  func verify(_ context: FunctionPassContext) {
+    require(vector.type.isBuiltinFixedArray,
+            "vector operand of vector_element_addr must be a Builtin.FixedArray")
+    require(type == vector.type.builtinFixedArrayElementType(in: parentFunction,
+                                                             maximallyAbstracted: true).addressType,
+            "result of vector_element_addr has wrong type")
   }
 }
 
@@ -210,7 +240,7 @@ private extension Operand {
     case let copy as SourceDestAddrInstruction:
       if self == copy.destinationOperand {
         return true
-      } else if self == copy.sourceOperand && copy.isTakeOfSrc {
+      } else if self == copy.sourceOperand && copy.isTakeOfSource {
         return true
       }
       return false

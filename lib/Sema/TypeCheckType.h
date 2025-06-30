@@ -19,7 +19,6 @@
 #include "swift/AST/Type.h"
 #include "swift/AST/TypeResolutionStage.h"
 #include "swift/AST/Types.h"
-#include "swift/Basic/LangOptions.h"
 
 namespace swift {
 
@@ -747,18 +746,6 @@ void diagnoseInvalidGenericArguments(SourceLoc loc, ValueDecl *decl,
 bool diagnoseMissingOwnership(ParamSpecifier ownership,
                               TypeRepr *repr, Type ty,
                               const TypeResolution &resolution);
-
-/// If the given type involves an unsafe type, diagnose it by calling the
-/// diagnose function with the most specific unsafe type that can be provided.
-void diagnoseUnsafeType(ASTContext &ctx, SourceLoc loc, Type type,
-                        AvailabilityContext availability,
-                        llvm::function_ref<void(Type)> diagnose);
-
-/// If the given type involves an unsafe type, diagnose it by calling the
-/// diagnose function with the most specific unsafe type that can be provided.
-void diagnoseUnsafeType(ASTContext &ctx, SourceLoc loc, Type type,
-                        const DeclContext *dc,
-                        llvm::function_ref<void(Type)> diagnose);
 
 } // end namespace swift
 

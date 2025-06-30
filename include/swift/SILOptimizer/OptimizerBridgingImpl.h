@@ -26,7 +26,9 @@
 #include "swift/SILOptimizer/Analysis/DominanceAnalysis.h"
 #include "swift/SILOptimizer/OptimizerBridging.h"
 #include "swift/SILOptimizer/PassManager/PassManager.h"
+#include "swift/SILOptimizer/PassManager/Transforms.h"
 #include "swift/SILOptimizer/Utils/InstOptUtils.h"
+#include "swift/SILOptimizer/Utils/DebugOptUtils.h"
 
 SWIFT_BEGIN_NULLABILITY_ANNOTATIONS
 
@@ -183,6 +185,10 @@ bool BridgedPassContext::moduleIsSerialized() const {
   return invocation->getPassManager()->getModule()->isSerialized();
 }
 
+bool BridgedPassContext::moduleHasLoweredAddresses() const {
+  return invocation->getPassManager()->getModule()->useLoweredAddresses();
+}
+
 bool BridgedPassContext::isTransforming(BridgedFunction function) const {
   return invocation->getFunction() == function.getFunction();
 }
@@ -215,6 +221,11 @@ BridgedDeclObj BridgedPassContext::getSwiftArrayDecl() const {
   return {mod->getASTContext().getArrayDecl()};
 }
 
+BridgedDeclObj BridgedPassContext::getSwiftMutableSpanDecl() const {
+  swift::SILModule *mod = invocation->getPassManager()->getModule();
+  return {mod->getASTContext().getMutableSpanDecl()};
+}
+
 // AST
 
 SWIFT_IMPORT_UNSAFE BRIDGED_INLINE
@@ -244,8 +255,8 @@ BridgedBasicBlock BridgedPassContext::appendBlock(BridgedFunction bridgedFunctio
   return {bridgedFunction.getFunction()->createBasicBlock()};
 }
 
-void BridgedPassContext::eraseInstruction(BridgedInstruction inst) const {
-  invocation->eraseInstruction(inst.unbridged());
+void BridgedPassContext::eraseInstruction(BridgedInstruction inst, bool salvageDebugInfo) const {
+  invocation->eraseInstruction(inst.unbridged(), salvageDebugInfo);
 }
 
 void BridgedPassContext::eraseBlock(BridgedBasicBlock block) const {
@@ -260,9 +271,6 @@ BridgedValue BridgedPassContext::getSILUndef(BridgedType type) const {
   return {swift::SILUndef::get(invocation->getFunction(), type.unbridged())};
 }
 
-bool BridgedPassContext::optimizeMemoryAccesses(BridgedFunction f) const {
-  return swift::optimizeMemoryAccesses(f.getFunction());
-}
 bool BridgedPassContext::eliminateDeadAllocations(BridgedFunction f) const {
   return swift::eliminateDeadAllocations(f.getFunction(),
                                          this->getDomTree().di);
@@ -444,7 +452,7 @@ OptionalBridgedWitnessTable BridgedPassContext::lookupWitnessTable(BridgedConfor
   return {mod->lookUpWitnessTable(ref.getConcrete())};
 }
 
-BridgedWitnessTable BridgedPassContext::createWitnessTable(BridgedLinkage linkage,
+BridgedWitnessTable BridgedPassContext::createSpecializedWitnessTable(BridgedLinkage linkage,
                                                            bool serialized,
                                                            BridgedConformance conformance,
                                                            BridgedArrayRef bridgedEntries) const {
@@ -456,7 +464,7 @@ BridgedWitnessTable BridgedPassContext::createWitnessTable(BridgedLinkage linkag
   return {swift::SILWitnessTable::create(*mod, (swift::SILLinkage)linkage,
                                          serialized ? swift::IsSerialized : swift::IsNotSerialized,
                                          conformance.unbridged().getConcrete(),
-                                         entries, {})};
+                                         entries, {}, /*specialized=*/true)};
 }
 
 BridgedVTable BridgedPassContext::createSpecializedVTable(BridgedType classType,
@@ -491,6 +499,11 @@ BridgedType BridgedPassContext::getBuiltinIntegerType(SwiftInt bitWidth) const {
   return swift::SILType::getBuiltinIntegerType(bitWidth, ctxt);
 }
 
+bool BridgedPassContext::calleesAreStaticallyKnowable(BridgedDeclRef method) const {
+  swift::SILModule *mod = invocation->getPassManager()->getModule();
+  return swift::calleesAreStaticallyKnowable(*mod, method.unbridged());
+}
+
 void BridgedPassContext::beginTransformFunction(BridgedFunction function) const {
   invocation->beginTransformFunction(function.getFunction());
 }
@@ -523,8 +536,9 @@ void BridgedPassContext::SSAUpdater_initialize(
 void BridgedPassContext::addFunctionToPassManagerWorklist(
     BridgedFunction newFunction, BridgedFunction oldFunction) const {
   swift::SILPassManager *pm = invocation->getPassManager();
-  pm->addFunctionToWorklist(newFunction.getFunction(),
-                            oldFunction.getFunction());
+  if (llvm::isa<swift::SILFunctionTransform>(invocation->getTransform())) {
+    pm->addFunctionToWorklist(newFunction.getFunction(), oldFunction.getFunction());
+  }
 }
 
 void BridgedPassContext::SSAUpdater_addAvailableValue(BridgedBasicBlock block, BridgedValue value) const {
@@ -546,9 +560,14 @@ bool BridgedPassContext::enableStackProtection() const {
   return mod->getOptions().EnableStackProtection;
 }
 
+bool BridgedPassContext::enableMergeableTraps() const {
+  swift::SILModule *mod = invocation->getPassManager()->getModule();
+  return mod->getOptions().MergeableTraps;
+}
+
 bool BridgedPassContext::hasFeature(BridgedFeature feature) const {
   swift::SILModule *mod = invocation->getPassManager()->getModule();
-  return mod->getASTContext().LangOpts.hasFeature((swift::Feature)feature);
+  return mod->getASTContext().LangOpts.hasFeature(swift::Feature(feature));
 }
 
 bool BridgedPassContext::enableMoveInoutStackProtection() const {
@@ -571,9 +590,23 @@ bool BridgedPassContext::shouldExpand(BridgedType ty) const {
   return swift::shouldExpand(mod, ty.unbridged());
 }
 
+BridgedDeclObj BridgedPassContext::getCurrentModuleContext() const {
+  return {invocation->getPassManager()->getModule()->getSwiftModule()};
+}
+
 bool BridgedPassContext::enableWMORequiredDiagnostics() const {
   swift::SILModule *mod = invocation->getPassManager()->getModule();
   return mod->getOptions().EnableWMORequiredDiagnostics;
+}
+
+bool BridgedPassContext::noAllocations() const {
+  swift::SILModule *mod = invocation->getPassManager()->getModule();
+  return mod->getOptions().NoAllocations;
+}
+
+bool BridgedPassContext::enableAddressDependencies() const {
+  swift::SILModule *mod = invocation->getPassManager()->getModule();
+  return mod->getOptions().EnableAddressDependencies;
 }
 
 static_assert((int)BridgedPassContext::SILStage::Raw == (int)swift::SILStage::Raw);

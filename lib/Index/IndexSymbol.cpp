@@ -242,13 +242,13 @@ SymbolInfo index::getSymbolInfoForDecl(const Decl *D) {
     case DeclKind::PatternBinding:
     case DeclKind::EnumCase:
     case DeclKind::TopLevelCode:
-    case DeclKind::PoundDiagnostic:
     case DeclKind::Missing:
     case DeclKind::MissingMember:
     case DeclKind::Module:
     case DeclKind::OpaqueType:
     case DeclKind::BuiltinTuple:
     case DeclKind::MacroExpansion:
+    case DeclKind::Using:
       break;
   }
 

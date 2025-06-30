@@ -2,7 +2,7 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2022 Apple Inc. and the Swift project authors
+// Copyright (c) 2022 - 2025 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
 // See https://swift.org/LICENSE.txt for license information
@@ -38,7 +38,7 @@
 // !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 
 #include "swift/Basic/BridgedSwiftObject.h"
-#include "swift/Basic/Compiler.h"
+#include "swift/Basic/SwiftBridging.h"
 
 #include <stddef.h>
 #include <stdint.h>
@@ -50,22 +50,9 @@
 
 #include "swift/Basic/SourceLoc.h"
 #include "llvm/ADT/StringRef.h"
+#include "llvm/ADT/APInt.h"
 #include <string>
 #include <vector>
-#endif
-
-// FIXME: We ought to be importing '<swift/bridging>' instead.
-#if __has_attribute(swift_name)
-#define SWIFT_NAME(NAME) __attribute__((swift_name(NAME)))
-#else
-#define SWIFT_NAME(NAME)
-#endif
-
-#if __has_attribute(availability)
-#define SWIFT_UNAVAILABLE(msg) \
-  __attribute__((availability(swift, unavailable, message=msg)))
-#else
-#define SWIFT_UNAVAILABLE(msg)
 #endif
 
 #ifdef PURE_BRIDGING_MODE
@@ -78,6 +65,7 @@
 namespace llvm {
 class raw_ostream;
 class StringRef;
+class VersionTuple;
 } // end namespace llvm
 
 namespace swift {
@@ -99,37 +87,46 @@ typedef uintptr_t SwiftUInt;
 // and Swift could import the underlying pointee type instead. We need to be
 // careful that the interface we expose remains consistent regardless of
 // PURE_BRIDGING_MODE.
-#define BRIDGING_WRAPPER_IMPL(Node, Name, Nullability)                         \
+#define BRIDGING_WRAPPER_IMPL(Node, Name, Qualifier, Nullability)              \
   class Bridged##Name {                                                        \
-    Node * Nullability Ptr;                                                    \
+    Qualifier Node *Nullability Ptr;                                           \
                                                                                \
   public:                                                                      \
     SWIFT_UNAVAILABLE("Use init(raw:) instead")                                \
-    Bridged##Name(Node * Nullability ptr) : Ptr(ptr) {}                        \
+    Bridged##Name(Qualifier Node *Nullability ptr) : Ptr(ptr) {}               \
                                                                                \
     SWIFT_UNAVAILABLE("Use '.raw' instead")                                    \
-    Node * Nullability unbridged() const { return Ptr; }                       \
+    Qualifier Node *Nullability unbridged() const { return Ptr; }              \
+                                                                               \
+    SWIFT_COMPUTED_PROPERTY                                                    \
+    Qualifier void *Nullability getRaw() const { return unbridged(); };        \
   };                                                                           \
                                                                                \
-  SWIFT_NAME("getter:Bridged" #Name ".raw(self:)")                             \
-  inline void * Nullability Bridged##Name##_getRaw(Bridged##Name bridged) {    \
-    return bridged.unbridged();                                                \
-  }                                                                            \
-                                                                               \
   SWIFT_NAME("Bridged" #Name ".init(raw:)")                                    \
-  inline Bridged##Name Bridged##Name##_fromRaw(void * Nullability ptr) {       \
-    return static_cast<Node *>(ptr);                                           \
+  inline Bridged##Name Bridged##Name##_fromRaw(                                \
+      Qualifier void *Nullability ptr) {                                       \
+    return static_cast<Qualifier Node *>(ptr);                                 \
   }
 
 // Bridging wrapper macros for convenience.
-#define BRIDGING_WRAPPER_NONNULL(Node, Name) \
-  BRIDGING_WRAPPER_IMPL(Node, Name, _Nonnull)
+#define BRIDGING_WRAPPER_NONNULL(Node, Name)                                   \
+  BRIDGING_WRAPPER_IMPL(Node, Name, /*unqualified*/, _Nonnull)
 
-#define BRIDGING_WRAPPER_NULLABLE(Node, Name) \
-  BRIDGING_WRAPPER_IMPL(Node, Nullable##Name, _Nullable)
+#define BRIDGING_WRAPPER_NULLABLE(Node, Name)                                  \
+  BRIDGING_WRAPPER_IMPL(Node, Nullable##Name, /*unqualified*/, _Nullable)
+
+#define BRIDGING_WRAPPER_CONST_NONNULL(Node, Name)                             \
+  BRIDGING_WRAPPER_IMPL(Node, Name, const, _Nonnull)
+
+#define BRIDGING_WRAPPER_CONST_NULLABLE(Node, Name)                            \
+  BRIDGING_WRAPPER_IMPL(Node, Nullable##Name, const, _Nullable)
 
 void assertFail(const char * _Nonnull msg, const char * _Nonnull file,
                 SwiftUInt line, const char * _Nonnull function);
+
+BRIDGED_INLINE
+SWIFT_UNAVAILABLE("Unavailable in Swift")
+void ASSERT_inBridgingHeader(bool condition);
 
 //===----------------------------------------------------------------------===//
 // MARK: ArrayRef
@@ -159,17 +156,19 @@ public:
     return {static_cast<const T *>(Data), Length};
   }
 #endif
+
+  SWIFT_COMPUTED_PROPERTY
+  const void *_Nullable getData() const { return Data; }
+
+  SWIFT_COMPUTED_PROPERTY
+  SwiftInt getCount() const { return static_cast<SwiftInt>(Length); }
+
+  SWIFT_COMPUTED_PROPERTY
+  bool getIsEmpty() const { return Length == 0; }
 };
 
-SWIFT_NAME("getter:BridgedArrayRef.data(self:)")
-BRIDGED_INLINE
-const void *_Nullable BridgedArrayRef_data(BridgedArrayRef arr);
-
-SWIFT_NAME("getter:BridgedArrayRef.count(self:)")
-BRIDGED_INLINE SwiftInt BridgedArrayRef_count(BridgedArrayRef arr);
-
 //===----------------------------------------------------------------------===//
-// MARK: Data
+// MARK: BridgedData
 //===----------------------------------------------------------------------===//
 
 class BridgedData {
@@ -185,17 +184,15 @@ public:
   SWIFT_NAME("init(baseAddress:count:)")
   BridgedData(const char *_Nullable baseAddress, size_t length)
       : BaseAddress(baseAddress), Length(length) {}
+
+  SWIFT_COMPUTED_PROPERTY
+  const char *_Nullable getBaseAddress() const { return BaseAddress; }
+
+  SWIFT_COMPUTED_PROPERTY
+  SwiftInt getCount() const { return static_cast<SwiftInt>(Length); }
+
+  void free() const;
 };
-
-SWIFT_NAME("getter:BridgedData.baseAddress(self:)")
-BRIDGED_INLINE
-const char *_Nullable BridgedData_baseAddress(BridgedData data);
-
-SWIFT_NAME("getter:BridgedData.count(self:)")
-BRIDGED_INLINE SwiftInt BridgedData_count(BridgedData data);
-
-SWIFT_NAME("BridgedData.free(self:)")
-void BridgedData_free(BridgedData data);
 
 //===----------------------------------------------------------------------===//
 // MARK: Feature
@@ -226,18 +223,17 @@ public:
   BridgedStringRef(const char *_Nullable data, size_t length)
       : Data(data), Length(length) {}
 
+  SWIFT_COMPUTED_PROPERTY
+  const uint8_t *_Nullable getData() const { return (const uint8_t *)Data; }
+
+  SWIFT_COMPUTED_PROPERTY
+  SwiftInt getCount() const { return Length; }
+
+  SWIFT_COMPUTED_PROPERTY
+  bool getIsEmpty() const { return Length == 0; }
+
   void write(BridgedOStream os) const;
 };
-
-SWIFT_NAME("getter:BridgedStringRef.data(self:)")
-BRIDGED_INLINE 
-const uint8_t *_Nullable BridgedStringRef_data(BridgedStringRef str);
-
-SWIFT_NAME("getter:BridgedStringRef.count(self:)")
-BRIDGED_INLINE SwiftInt BridgedStringRef_count(BridgedStringRef str);
-
-SWIFT_NAME("getter:BridgedStringRef.isEmpty(self:)")
-BRIDGED_INLINE bool BridgedStringRef_empty(BridgedStringRef str);
 
 class BridgedOwnedString {
   char *_Nonnull Data;
@@ -245,21 +241,59 @@ class BridgedOwnedString {
 
 public:
   BridgedOwnedString(llvm::StringRef stringToCopy);
-
   BRIDGED_INLINE llvm::StringRef unbridgedRef() const;
+
+  SWIFT_COMPUTED_PROPERTY
+  const uint8_t *_Nonnull getData() const {
+    return (const uint8_t *)(Data ? Data : "");
+  }
+
+  SWIFT_COMPUTED_PROPERTY
+  SwiftInt getCount() const { return Length; }
+
+  SWIFT_COMPUTED_PROPERTY
+  bool getIsEmpty() const { return Length == 0; }
 
   void destroy() const;
 } SWIFT_SELF_CONTAINED;
 
-SWIFT_NAME("getter:BridgedOwnedString.data(self:)")
-BRIDGED_INLINE 
-const uint8_t *_Nullable BridgedOwnedString_data(BridgedOwnedString str);
+//===----------------------------------------------------------------------===//
+// MARK: BridgedOptional
+//===----------------------------------------------------------------------===//
 
-SWIFT_NAME("getter:BridgedOwnedString.count(self:)")
-BRIDGED_INLINE SwiftInt BridgedOwnedString_count(BridgedOwnedString str);
+// FIXME: We should be able to make this a template once
+// https://github.com/swiftlang/swift/issues/82258 is fixed.
+#define BRIDGED_OPTIONAL(TYPE, SUFFIX)                                         \
+  class SWIFT_CONFORMS_TO_PROTOCOL(Swift.ExpressibleByNilLiteral)              \
+      BridgedOptional##SUFFIX {                                                \
+    TYPE _value;                                                               \
+    bool _hasValue;                                                            \
+                                                                               \
+  public:                                                                      \
+    SWIFT_NAME("init(nilLiteral:)")                                            \
+    BridgedOptional##SUFFIX(void) : _hasValue(false) {}                        \
+    BridgedOptional##SUFFIX(TYPE value) : _value(value), _hasValue(true) {}    \
+                                                                               \
+    SWIFT_COMPUTED_PROPERTY                                                    \
+    TYPE getValue() const {                                                    \
+      ASSERT_inBridgingHeader(_hasValue);                                      \
+      return _value;                                                           \
+    }                                                                          \
+                                                                               \
+    SWIFT_COMPUTED_PROPERTY                                                    \
+    bool getHasValue() const { return _hasValue; }                             \
+  };
+BRIDGED_OPTIONAL(SwiftInt, Int)
 
-SWIFT_NAME("getter:BridgedOwnedString.isEmpty(self:)")
-BRIDGED_INLINE bool BridgedOwnedString_empty(BridgedOwnedString str);
+#ifdef USED_IN_CPP_SOURCE
+inline BridgedOptionalInt getFromAPInt(llvm::APInt i) {
+  if (i.getSignificantBits() <=
+      std::min(std::numeric_limits<SwiftInt>::digits, 64)) {
+    return {(SwiftInt)i.getSExtValue()};
+  }
+  return {};
+}
+#endif
 
 //===----------------------------------------------------------------------===//
 // MARK: OStream
@@ -272,8 +306,15 @@ public:
   SWIFT_UNAVAILABLE("Use init(raw:) instead")
   BridgedOStream(llvm::raw_ostream * _Nonnull os) : os(os) {}
 
+  SWIFT_NAME("init(raw:)")
+  BridgedOStream(void *_Nonnull os)
+      : os(static_cast<llvm::raw_ostream *>(os)) {}
+
   SWIFT_UNAVAILABLE("Use '.raw' instead")
   llvm::raw_ostream * _Nonnull unbridged() const { return os; }
+
+  SWIFT_COMPUTED_PROPERTY
+  void *_Nonnull getRaw(BridgedOStream bridged) const { return unbridged(); }
 
   void write(BridgedStringRef string) const;
 
@@ -281,16 +322,6 @@ public:
 
   void flush() const;
 };
-
-SWIFT_NAME("getter:BridgedOStream.raw(self:)")
-inline void * _Nonnull BridgedOStream_getRaw(BridgedOStream bridged) {
-  return bridged.unbridged();
-}
-
-SWIFT_NAME("BridgedOStream.init(raw:)")
-inline BridgedOStream BridgedOStream_fromRaw(void * _Nonnull os) {
-  return static_cast<llvm::raw_ostream *>(os);
-}
 
 BridgedOStream Bridged_dbgs();
 
@@ -314,13 +345,13 @@ public:
   SWIFT_IMPORT_UNSAFE
   const void *_Nullable getOpaquePointerValue() const { return Raw; }
 
+  SWIFT_COMPUTED_PROPERTY
+  bool getIsValid() const { return Raw != nullptr; }
+
   SWIFT_NAME("advanced(by:)")
   BRIDGED_INLINE
   BridgedSourceLoc advancedBy(size_t n) const;
 };
-
-SWIFT_NAME("getter:BridgedSourceLoc.isValid(self:)")
-BRIDGED_INLINE bool BridgedSourceLoc_isValid(BridgedSourceLoc loc);
 
 //===----------------------------------------------------------------------===//
 // MARK: SourceRange
@@ -364,19 +395,13 @@ public:
   BRIDGED_INLINE BridgedCharSourceRange(swift::CharSourceRange range);
 
   BRIDGED_INLINE swift::CharSourceRange unbridged() const;
+
+  SWIFT_COMPUTED_PROPERTY
+  BridgedSourceLoc getStart() const { return Start; }
+
+  SWIFT_COMPUTED_PROPERTY
+  SwiftInt getByteLength() const { return static_cast<SwiftInt>(ByteLength); }
 };
-
-SWIFT_NAME("getter:BridgedCharSourceRange.start(self:)")
-inline BridgedSourceLoc
-BridgedCharSourceRange_start(BridgedCharSourceRange range) {
-  return range.Start;
-}
-
-SWIFT_NAME("getter:BridgedCharSourceRange.byteLength(self:)")
-inline SwiftInt
-BridgedCharSourceRange_byteLength(BridgedCharSourceRange range) {
-  return static_cast<SwiftInt>(range.ByteLength);
-}
 
 //===----------------------------------------------------------------------===//
 // MARK: std::vector<BridgedCharSourceRange>
@@ -445,7 +470,7 @@ enum ENUM_EXTENSIBILITY_ATTR(closed) BridgedGeneratedSourceFileKind {
   BridgedGeneratedSourceFileKindReplacedFunctionBody,
   BridgedGeneratedSourceFileKindPrettyPrinted,
   BridgedGeneratedSourceFileKindDefaultArgument,
-  BridgedGeneratedSourceFileKindAttribute,
+  BridgedGeneratedSourceFileKindAttributeFromClang,
 
   BridgedGeneratedSourceFileKindNone,
 };
@@ -460,6 +485,56 @@ struct BridgedVirtualFile {
   BridgedStringRef Name;
   ptrdiff_t LineOffset;
   size_t NamePosition;
+};
+
+//===----------------------------------------------------------------------===//
+// MARK: VersionTuple
+//===----------------------------------------------------------------------===//
+
+struct BridgedVersionTuple {
+  unsigned Major : 32;
+
+  unsigned Minor : 31;
+  unsigned HasMinor : 1;
+
+  unsigned Subminor : 31;
+  unsigned HasSubminor : 1;
+
+  unsigned Build : 31;
+  unsigned HasBuild : 1;
+
+  BridgedVersionTuple()
+      : Major(0), Minor(0), HasMinor(false), Subminor(0), HasSubminor(false),
+        Build(0), HasBuild(false) {}
+  BridgedVersionTuple(unsigned Major)
+      : Major(Major), Minor(0), HasMinor(false), Subminor(0),
+        HasSubminor(false), Build(0), HasBuild(false) {}
+  BridgedVersionTuple(unsigned Major, unsigned Minor)
+      : Major(Major), Minor(Minor), HasMinor(true), Subminor(0),
+        HasSubminor(false), Build(0), HasBuild(false) {}
+  BridgedVersionTuple(unsigned Major, unsigned Minor, unsigned Subminor)
+      : Major(Major), Minor(Minor), HasMinor(true), Subminor(Subminor),
+        HasSubminor(true), Build(0), HasBuild(false) {}
+  BridgedVersionTuple(unsigned Major, unsigned Minor, unsigned Subminor,
+                      unsigned Build)
+      : Major(Major), Minor(Minor), HasMinor(true), Subminor(Subminor),
+        HasSubminor(true), Build(Build), HasBuild(true) {}
+
+  BridgedVersionTuple(llvm::VersionTuple);
+
+  llvm::VersionTuple unbridged() const;
+};
+
+//===----------------------------------------------------------------------===//
+// MARK: BridgedSwiftClosure
+//===----------------------------------------------------------------------===//
+
+/// Wrapping a pointer to a Swift closure `(UnsafeRawPointer?) -> Void`
+/// See 'withBridgedSwiftClosure(closure:call:)' in ASTGen.
+struct BridgedSwiftClosure {
+  const void *_Nonnull closure;
+
+  BRIDGED_INLINE void operator()(const void *_Nullable);
 };
 
 SWIFT_END_NULLABILITY_ANNOTATIONS

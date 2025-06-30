@@ -19,7 +19,6 @@
 
 #include "swift/AST/ASTContext.h"
 #include "swift/AST/ASTNode.h"
-#include "swift/AST/DiagnosticsParse.h"
 #include "swift/AST/Expr.h"
 #include "swift/AST/LayoutConstraint.h"
 #include "swift/AST/LifetimeDependence.h"
@@ -42,6 +41,7 @@ namespace llvm {
 }
 
 namespace swift {
+  class AvailabilitySpec;
   class CodeCompletionCallbacks;
   class DoneParsingCallback;
   class DefaultArgumentInitializer;
@@ -53,7 +53,7 @@ namespace swift {
   class SILParserStateBase;
   class SourceManager;
   class UUID;
-  
+
   struct EnumElementInfo;
 
   /// Different contexts in which BraceItemList are parsed.
@@ -542,29 +542,7 @@ public:
   /// diagnose it if not permitted in this mode.
   /// \param diagnoseDollarPrefix Whether to diagnose dollar-prefixed
   /// identifiers in addition to a standalone '$'.
-  void diagnoseDollarIdentifier(const Token &tok,
-                                bool diagnoseDollarPrefix) {
-    assert(tok.getText()[0] == '$');
-
-    // If '$' is not guarded by backticks, offer
-    // to replace it with '`$`'.
-    if (Tok.getRawText() == "$") {
-      diagnose(Tok.getLoc(), diag::standalone_dollar_identifier)
-          .fixItReplace(Tok.getLoc(), "`$`");
-      return;
-    }
-
-    if (!diagnoseDollarPrefix)
-      return;
-
-    if (tok.getText().size() == 1 || Context.LangOpts.EnableDollarIdentifiers ||
-        isInSILMode() || L->isSwiftInterface() ||
-        isInMacroExpansion(tok.getLoc()))
-      return;
-
-    diagnose(tok.getLoc(), diag::dollar_identifier_decl,
-             Context.getIdentifier(tok.getText()));
-  }
+  void diagnoseDollarIdentifier(const Token &tok, bool diagnoseDollarPrefix);
 
   /// Retrieve the location just past the end of the previous
   /// source location.
@@ -1006,7 +984,7 @@ public:
     DeclAttributes &attributes, bool ifConfigsAreDeclAttrs);
 
   /// Parse a #error or #warning diagnostic.
-  ParserResult<PoundDiagnosticDecl> parseDeclPoundDiagnostic();
+  ParserStatus parseDeclPoundDiagnostic();
 
   /// Parse a #line/#sourceLocation directive.
   /// 'isLine = true' indicates parsing #line instead of #sourcelocation
@@ -1060,20 +1038,20 @@ public:
                           bool isAttrModifier, SourceRange &parensRange,
                           llvm::function_ref<ParserStatus()> parseAttr);
 
-  /// Parse the @_specialize attribute.
+  /// Parse the @_specialize/@specialized attribute.
   /// \p closingBrace is the expected closing brace, which can be either ) or ]
   /// \p Attr is where to store the parsed attribute
   bool parseSpecializeAttribute(
-      swift::tok ClosingBrace, SourceLoc AtLoc, SourceLoc Loc,
-      SpecializeAttr *&Attr, AvailabilityRange *SILAvailability,
+      swift::tok ClosingBrace, SourceLoc AtLoc, SourceLoc Loc, bool isPublic,
+      AbstractSpecializeAttr *&Attr, AvailabilityRange *SILAvailability,
       llvm::function_ref<bool(Parser &)> parseSILTargetName =
           [](Parser &) { return false; },
       llvm::function_ref<bool(Parser &)> parseSILSIPModule =
           [](Parser &) { return false; });
 
-  /// Parse the arguments inside the @_specialize attribute
+  /// Parse the arguments inside the @_specialize/@specialized attribute
   bool parseSpecializeAttributeArguments(
-      swift::tok ClosingBrace, bool &DiscardAttribute,
+      swift::tok ClosingBrace, bool isPublic, bool &DiscardAttribute,
       std::optional<bool> &Exported,
       std::optional<SpecializeAttr::SpecializationKind> &Kind,
       TrailingWhereClause *&TrailingWhereClause, DeclNameRef &targetFunction,
@@ -1149,8 +1127,8 @@ public:
   );
 
   /// Parse the @lifetime attribute.
-  ParserResult<LifetimeAttr> parseLifetimeAttribute(SourceLoc AtLoc,
-                                                    SourceLoc Loc);
+  ParserResult<LifetimeAttr>
+  parseLifetimeAttribute(StringRef attrName, SourceLoc atLoc, SourceLoc loc);
 
   /// Common utility to parse swift @lifetime decl attribute and SIL @lifetime
   /// type modifier.
@@ -1180,7 +1158,8 @@ public:
 
   bool isParameterSpecifier() {
     if (Tok.is(tok::kw_inout)) return true;
-    if (Context.LangOpts.hasFeature(Feature::LifetimeDependence) &&
+    if ((Context.LangOpts.hasFeature(Feature::LifetimeDependence) ||
+         Context.LangOpts.hasFeature(Feature::Lifetimes)) &&
         isSILLifetimeDependenceToken())
       return true;
     if (!canHaveParameterSpecifierContextualKeyword()) return false;
@@ -1190,6 +1169,8 @@ public:
         Tok.isContextualKeyword("consuming") ||
         Tok.isContextualKeyword("isolated") ||
         Tok.isContextualKeyword("_const"))
+      return true;
+    if (isCallerIsolatedSpecifier())
       return true;
     if (Context.LangOpts.hasFeature(Feature::SendingArgsAndResults) &&
         Tok.isContextualKeyword("sending"))
@@ -1207,6 +1188,12 @@ public:
   bool isSILLifetimeDependenceToken() {
     return isInSILMode() && Tok.is(tok::at_sign) &&
            (peekToken().isContextualKeyword("lifetime"));
+  }
+
+  bool isCallerIsolatedSpecifier() {
+    if (!Tok.isContextualKeyword("nonisolated"))
+      return false;
+    return peekToken().isFollowingLParen();
   }
 
   bool canHaveParameterSpecifierContextualKeyword() {
@@ -1236,6 +1223,9 @@ public:
 
   ParserResult<ImportDecl> parseDeclImport(ParseDeclOptions Flags,
                                            DeclAttributes &Attributes);
+
+  ParserResult<UsingDecl> parseDeclUsing(ParseDeclOptions Flags,
+                                         DeclAttributes &Attributes);
 
   /// Parse an inheritance clause into a vector of InheritedEntry's.
   ///
@@ -1443,6 +1433,7 @@ public:
     SourceLoc IsolatedLoc;
     SourceLoc ConstLoc;
     SourceLoc SendingLoc;
+    SourceLoc CallerIsolatedLoc;
     SmallVector<TypeOrCustomAttr> Attributes;
     LifetimeEntry *lifetimeEntry = nullptr;
 
@@ -1480,6 +1471,14 @@ public:
   ParserResult<TypeRepr> parseTypeTupleBody();
   ParserResult<TypeRepr> parseTypeArray(ParserResult<TypeRepr> Base);
 
+  /// Whether the parser is at the start of an InlineArray type body.
+  bool isStartOfInlineArrayTypeBody();
+
+  /// Parse an InlineArray type '[' integer 'x' type ']'.
+  ///
+  /// NOTE: 'isStartOfInlineArrayTypeBody' must be true.
+  ParserResult<TypeRepr> parseTypeInlineArray(SourceLoc lSquare);
+
   /// Parse a collection type.
   ///   type-simple:
   ///     '[' type ']'
@@ -1503,7 +1502,6 @@ public:
   /// A structure for collecting information about the default
   /// arguments of a context.
   struct DefaultArgumentInfo {
-    llvm::SmallVector<DefaultArgumentInitializer *, 4> ParsedContexts;
     unsigned NextIndex : 31;
     
     /// Track whether or not one of the parameters in a signature's argument
@@ -1514,10 +1512,6 @@ public:
     /// all the arguments, not just those that have default arguments.
     unsigned claimNextIndex() { return NextIndex++; }
 
-    /// Set the parsed context of all default argument initializers to
-    /// the given function, enum case or subscript.
-    void setFunctionContext(DeclContext *DC, ParameterList *paramList);
-    
     DefaultArgumentInfo() {
       NextIndex = 0;
       HasDefaultArgument = false;
@@ -1565,6 +1559,9 @@ public:
 
     /// The default argument for this parameter.
     Expr *DefaultArg = nullptr;
+
+    /// The default argument for this parameter.
+    DefaultArgumentInitializer *DefaultArgInitContext = nullptr;
 
     /// True if we emitted a parse error about this parameter.
     bool isInvalid = false;
@@ -1715,7 +1712,13 @@ public:
   /// and the expression will parse with the '<' as an operator.
   bool canParseAsGenericArgumentList();
 
+  bool canParseTypeSimple();
+  bool canParseTypeSimpleOrComposition();
+  bool canParseTypeScalar();
   bool canParseType();
+
+  bool canParseStartOfInlineArrayType();
+  bool canParseCollectionType();
 
   /// Returns true if a simple type identifier can be parsed.
   ///
@@ -1732,6 +1735,10 @@ public:
 
   /// Returns true if a qualified declaration name base type can be parsed.
   bool canParseBaseTypeForQualifiedDeclName();
+
+  /// Returns true if `nonisolated` contextual keyword could be parsed
+  /// as part of the type a the current location.
+  bool canParseNonisolatedAsTypeModifier();
 
   /// Returns true if the current token is '->' or effects specifiers followed
   /// by '->'.
@@ -1788,7 +1795,10 @@ public:
   /// \param name The parsed name of the label (empty if it doesn't exist, or is
   /// _)
   /// \param loc The location of the label (empty if it doesn't exist)
-  void parseOptionalArgumentLabel(Identifier &name, SourceLoc &loc);
+  /// \param isAttr True if this is an argument label for an attribute (allows, but deprecates, use of
+  ///               \c '=' instead of \c ':').
+  void parseOptionalArgumentLabel(Identifier &name, SourceLoc &loc,
+                                  bool isAttr = false);
 
   enum class DeclNameFlag : uint8_t {
     /// If passed, operator basenames are allowed.
@@ -1990,7 +2000,8 @@ public:
   ParserResult<CaseStmt> parseStmtCatch();
   ParserResult<Stmt> parseStmtForEach(LabeledStmtInfo LabelInfo);
   ParserResult<Stmt> parseStmtSwitch(LabeledStmtInfo LabelInfo);
-  ParserStatus parseStmtCases(SmallVectorImpl<ASTNode> &cases, bool IsActive);
+  ParserStatus parseStmtCases(SmallVectorImpl<CaseStmt *> &cases,
+                              bool IsActive);
   ParserResult<CaseStmt> parseStmtCase(bool IsActive);
   ParserResult<Stmt> parseStmtPoundAssert();
 
@@ -2047,27 +2058,15 @@ public:
   ParserStatus
   parseAvailabilityMacro(SmallVectorImpl<AvailabilitySpec *> &Specs);
 
-  /// Parse the availability macros definitions passed as arguments.
-  AvailabilityMacroMap &parseAllAvailabilityMacroArguments();
-
-  /// Result of parsing an availability macro definition.
-  struct AvailabilityMacroDefinition {
-    StringRef Name;
-    llvm::VersionTuple Version;
-    SmallVector<AvailabilitySpec *, 4> Specs;
-  };
-
   /// Parse an availability macro definition from a command line argument.
-  /// This function should be called on a Parser set up on the command line
+  /// This function should only be called on a Parser set up on the command line
   /// argument code.
   ParserStatus
-  parseAvailabilityMacroDefinition(AvailabilityMacroDefinition &Result);
+  parseAvailabilityMacroDefinition(std::string &Name,
+                                   llvm::VersionTuple &Version,
+                                   SmallVectorImpl<AvailabilitySpec *> &Specs);
 
   ParserResult<AvailabilitySpec> parseAvailabilitySpec();
-  ParserResult<PlatformVersionConstraintAvailabilitySpec>
-  parsePlatformVersionConstraintSpec();
-  ParserResult<PlatformAgnosticVersionConstraintAvailabilitySpec>
-  parsePlatformAgnosticVersionConstraintSpec();
   bool
   parseAvailability(bool parseAsPartOfSpecializeAttr, StringRef AttrName,
                     bool &DiscardAttribute, SourceRange &attrRange,

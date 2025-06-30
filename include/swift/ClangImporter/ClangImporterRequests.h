@@ -24,6 +24,7 @@
 #include "swift/Basic/Statistic.h"
 #include "swift/ClangImporter/ClangImporter.h"
 #include "clang/AST/Type.h"
+#include "clang/Basic/Specifiers.h"
 #include "llvm/ADT/Hashing.h"
 #include "llvm/ADT/TinyPtrVector.h"
 
@@ -31,6 +32,7 @@ namespace swift {
 class Decl;
 class DeclName;
 class EnumDecl;
+enum class ExplicitSafety;
 
 /// The input type for a clang direct lookup request.
 struct ClangDirectLookupDescriptor final {
@@ -132,30 +134,56 @@ private:
 };
 
 /// The input type for a record member lookup request.
+///
+/// These lookups may be requested recursively in the case of inheritance,
+/// for which we separately keep track of the derived class where we started
+/// looking (startDecl) and the access level for the current inheritance.
 struct ClangRecordMemberLookupDescriptor final {
-  NominalTypeDecl *recordDecl;
-  DeclName name;
-  bool inherited;
+  NominalTypeDecl *recordDecl;     // Where we are currently looking
+  NominalTypeDecl *inheritingDecl; // Where we started looking from
+  DeclName name;                   // What we are looking for
+  ClangInheritanceInfo inheritance;
 
-  ClangRecordMemberLookupDescriptor(NominalTypeDecl *recordDecl, DeclName name,
-                                    bool inherited = false)
-      : recordDecl(recordDecl), name(name), inherited(inherited) {
+  ClangRecordMemberLookupDescriptor(NominalTypeDecl *recordDecl, DeclName name)
+      : recordDecl(recordDecl), inheritingDecl(recordDecl), name(name),
+        inheritance() {
     assert(isa<clang::RecordDecl>(recordDecl->getClangDecl()));
   }
 
   friend llvm::hash_code
   hash_value(const ClangRecordMemberLookupDescriptor &desc) {
-    return llvm::hash_combine(desc.name, desc.recordDecl);
+    return llvm::hash_combine(desc.name, desc.recordDecl, desc.inheritingDecl,
+                              desc.inheritance);
   }
 
   friend bool operator==(const ClangRecordMemberLookupDescriptor &lhs,
                          const ClangRecordMemberLookupDescriptor &rhs) {
-    return lhs.name == rhs.name && lhs.recordDecl == rhs.recordDecl;
+    return lhs.name == rhs.name && lhs.recordDecl == rhs.recordDecl &&
+           lhs.inheritingDecl == rhs.inheritingDecl &&
+           lhs.inheritance == rhs.inheritance;
   }
 
   friend bool operator!=(const ClangRecordMemberLookupDescriptor &lhs,
                          const ClangRecordMemberLookupDescriptor &rhs) {
     return !(lhs == rhs);
+  }
+
+private:
+  friend class ClangRecordMemberLookup;
+
+  // This private constructor should only be used in ClangRecordMemberLookup,
+  // for recursively traversing base classes that inheritingDecl inherites from.
+  ClangRecordMemberLookupDescriptor(NominalTypeDecl *recordDecl, DeclName name,
+                                    NominalTypeDecl *inheritingDecl,
+                                    ClangInheritanceInfo inheritance)
+      : recordDecl(recordDecl), inheritingDecl(inheritingDecl), name(name),
+        inheritance(inheritance) {
+    assert(isa<clang::RecordDecl>(recordDecl->getClangDecl()));
+    assert(isa<clang::CXXRecordDecl>(inheritingDecl->getClangDecl()));
+    assert(inheritance.isInheriting() &&
+           "recursive calls should indicate inheritance");
+    assert(recordDecl != inheritingDecl &&
+           "recursive calls should lookup elsewhere");
   }
 };
 
@@ -319,8 +347,10 @@ enum class CxxRecordSemanticsKind {
   MoveOnly,
   Reference,
   Iterator,
-  // A record that is either not copyable or not destructible.
+  // A record that is either not copyable/movable or not destructible.
   MissingLifetimeOperation,
+  // A record that has no copy and no move operations
+  UnavailableConstructors,
   // A C++ record that represents a Swift class type exposed to C++ from Swift.
   SwiftClassType
 };
@@ -328,16 +358,11 @@ enum class CxxRecordSemanticsKind {
 struct CxxRecordSemanticsDescriptor final {
   const clang::RecordDecl *decl;
   ASTContext &ctx;
-
-  /// Whether to emit warnings for missing destructor or copy constructor
-  /// whenever the classification of the type assumes that they exist (e.g. for
-  /// a value type).
-  bool shouldDiagnoseLifetimeOperations;
+  ClangImporter::Implementation *importerImpl;
 
   CxxRecordSemanticsDescriptor(const clang::RecordDecl *decl, ASTContext &ctx,
-                               bool shouldDiagnoseLifetimeOperations = true)
-      : decl(decl), ctx(ctx),
-        shouldDiagnoseLifetimeOperations(shouldDiagnoseLifetimeOperations) {}
+                               ClangImporter::Implementation *importerImpl)
+      : decl(decl), ctx(ctx), importerImpl(importerImpl) {}
 
   friend llvm::hash_code hash_value(const CxxRecordSemanticsDescriptor &desc) {
     return llvm::hash_combine(desc.decl);
@@ -402,10 +427,8 @@ private:
 
 struct SafeUseOfCxxDeclDescriptor final {
   const clang::Decl *decl;
-  ASTContext &ctx;
 
-  SafeUseOfCxxDeclDescriptor(const clang::Decl *decl, ASTContext &ctx)
-      : decl(decl), ctx(ctx) {}
+  SafeUseOfCxxDeclDescriptor(const clang::Decl *decl) : decl(decl) {}
 
   friend llvm::hash_code hash_value(const SafeUseOfCxxDeclDescriptor &desc) {
     return llvm::hash_combine(desc.decl);
@@ -513,7 +536,10 @@ enum class CxxEscapability { Escapable, NonEscapable, Unknown };
 
 struct EscapabilityLookupDescriptor final {
   const clang::Type *type;
-  ClangImporter::Implementation &impl;
+  ClangImporter::Implementation *impl;
+  // Only explicitly ~Escapable annotated types are considered ~Escapable.
+  // This is for backward compatibility, so we continue to import aggregates
+  // containing pointers as Escapable types.
   bool annotationOnly = true;
 
   friend llvm::hash_code hash_value(const EscapabilityLookupDescriptor &desc) {
@@ -549,6 +575,53 @@ private:
 
 void simple_display(llvm::raw_ostream &out, EscapabilityLookupDescriptor desc);
 SourceLoc extractNearestSourceLoc(EscapabilityLookupDescriptor desc);
+
+struct CxxDeclExplicitSafetyDescriptor final {
+  const clang::Decl *decl;
+  bool isClass;
+
+  CxxDeclExplicitSafetyDescriptor(const clang::Decl *decl, bool isClass)
+      : decl(decl), isClass(isClass) {}
+
+  friend llvm::hash_code
+  hash_value(const CxxDeclExplicitSafetyDescriptor &desc) {
+    return llvm::hash_combine(desc.decl, desc.isClass);
+  }
+
+  friend bool operator==(const CxxDeclExplicitSafetyDescriptor &lhs,
+                         const CxxDeclExplicitSafetyDescriptor &rhs) {
+    return lhs.decl == rhs.decl && lhs.isClass == rhs.isClass;
+  }
+
+  friend bool operator!=(const CxxDeclExplicitSafetyDescriptor &lhs,
+                         const CxxDeclExplicitSafetyDescriptor &rhs) {
+    return !(lhs == rhs);
+  }
+};
+
+void simple_display(llvm::raw_ostream &out,
+                    CxxDeclExplicitSafetyDescriptor desc);
+SourceLoc extractNearestSourceLoc(CxxDeclExplicitSafetyDescriptor desc);
+
+/// Determine the safety of the given Clang declaration.
+class ClangDeclExplicitSafety
+    : public SimpleRequest<ClangDeclExplicitSafety,
+                           ExplicitSafety(CxxDeclExplicitSafetyDescriptor),
+                           RequestFlags::Cached> {
+public:
+  using SimpleRequest::SimpleRequest;
+
+  // Source location
+  SourceLoc getNearestLoc() const { return SourceLoc(); };
+  bool isCached() const;
+
+private:
+  friend SimpleRequest;
+
+  // Evaluation.
+  ExplicitSafety evaluate(Evaluator &evaluator,
+                          CxxDeclExplicitSafetyDescriptor desc) const;
+};
 
 #define SWIFT_TYPEID_ZONE ClangImporter
 #define SWIFT_TYPEID_HEADER "swift/ClangImporter/ClangImporterTypeIDZone.def"

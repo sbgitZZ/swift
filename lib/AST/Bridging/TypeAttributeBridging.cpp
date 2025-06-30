@@ -2,7 +2,7 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2022-2024 Apple Inc. and the Swift project authors
+// Copyright (c) 2022-2025 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
 // See https://swift.org/LICENSE.txt for license information
@@ -23,62 +23,59 @@ using namespace swift;
 // MARK: TypeAttributes
 //===----------------------------------------------------------------------===//
 
-BridgedTypeAttrKind BridgedTypeAttrKind_fromString(BridgedStringRef cStr) {
+// Define `.asTypeAttr` on each BridgedXXXTypeAttr type.
+#define SIMPLE_TYPE_ATTR(...)
+#define TYPE_ATTR(SPELLING, CLASS)                                             \
+  SWIFT_NAME("getter:Bridged" #CLASS "TypeAttr.asTypeAttribute(self:)")        \
+  BridgedTypeAttribute Bridged##CLASS##TypeAttr_asTypeAttribute(               \
+      Bridged##CLASS##TypeAttr attr) {                                         \
+    return attr.unbridged();                                                   \
+  }
+#include "swift/AST/TypeAttr.def"
+
+BridgedOptionalTypeAttrKind
+BridgedOptionalTypeAttrKind_fromString(BridgedStringRef cStr) {
   auto optKind = TypeAttribute::getAttrKindFromString(cStr.unbridged());
-  if (!optKind)
-    return BridgedTypeAttrKindNone;
-  switch (*optKind) {
-#define TYPE_ATTR(_, CLASS)                                                    \
-  case TypeAttrKind::CLASS:                                                    \
-    return BridgedTypeAttrKind##CLASS;
-#include "swift/AST/TypeAttr.def"
+  if (!optKind) {
+    return BridgedOptionalTypeAttrKind();
   }
-}
-
-static std::optional<TypeAttrKind> unbridged(BridgedTypeAttrKind kind) {
-  switch (kind) {
-#define TYPE_ATTR(_, CLASS)                                                    \
-  case BridgedTypeAttrKind##CLASS:                                             \
-    return TypeAttrKind::CLASS;
-#include "swift/AST/TypeAttr.def"
-  case BridgedTypeAttrKindNone:
-    return std::nullopt;
-  }
-  llvm_unreachable("unhandled enum value");
-}
-
-BridgedTypeAttributes BridgedTypeAttributes_create() {
-  return new TypeAttributes();
-}
-
-void BridgedTypeAttributes_delete(BridgedTypeAttributes cAttributes) {
-  delete cAttributes.unbridged();
-}
-
-void BridgedTypeAttributes_add(BridgedTypeAttributes cAttributes,
-                               BridgedTypeAttribute cAttribute) {
-  cAttributes.unbridged()->attrs.push_back(cAttribute.unbridged());
-}
-
-bool BridgedTypeAttributes_isEmpty(BridgedTypeAttributes cAttributes) {
-  TypeAttributes *typeAttributes = cAttributes.unbridged();
-  return typeAttributes->attrs.empty();
+  return *optKind;
 }
 
 BridgedTypeAttribute BridgedTypeAttribute_createSimple(
-    BridgedASTContext cContext, BridgedTypeAttrKind cKind,
+    BridgedASTContext cContext, swift::TypeAttrKind kind,
     BridgedSourceLoc cAtLoc, BridgedSourceLoc cNameLoc) {
-  auto optKind = unbridged(cKind);
-  assert(optKind && "creating attribute of invalid kind?");
-  return TypeAttribute::createSimple(cContext.unbridged(), *optKind,
+  return TypeAttribute::createSimple(cContext.unbridged(), kind,
                                      cAtLoc.unbridged(), cNameLoc.unbridged());
 }
 
-BridgedTypeAttribute BridgedTypeAttribute_createIsolated(
+BridgedConventionTypeAttr BridgedConventionTypeAttr_createParsed(
     BridgedASTContext cContext, BridgedSourceLoc cAtLoc,
-    BridgedSourceLoc cNameLoc, BridgedSourceLoc cLPLoc,
-    BridgedSourceLoc cIsolationLoc,
-    BridgedIsolatedTypeAttrIsolationKind cIsolation, BridgedSourceLoc cRPLoc) {
+    BridgedSourceLoc cKwLoc, BridgedSourceRange cParens, BridgedStringRef cName,
+    BridgedSourceLoc cNameLoc, BridgedDeclNameRef cWitnessMethodProtocol,
+    BridgedStringRef cClangType, BridgedSourceLoc cClangTypeLoc) {
+  return new (cContext.unbridged()) ConventionTypeAttr(
+      cAtLoc.unbridged(), cKwLoc.unbridged(), cParens.unbridged(),
+      {cName.unbridged(), cNameLoc.unbridged()},
+      cWitnessMethodProtocol.unbridged(),
+      {cClangType.unbridged(), cClangTypeLoc.unbridged()});
+}
+
+BridgedDifferentiableTypeAttr BridgedDifferentiableTypeAttr_createParsed(
+    BridgedASTContext cContext, BridgedSourceLoc cAtLoc,
+    BridgedSourceLoc cNameLoc, BridgedSourceRange cParensRange,
+    BridgedDifferentiabilityKind cKind, BridgedSourceLoc cKindLoc) {
+  return new (cContext.unbridged()) DifferentiableTypeAttr(
+      cAtLoc.unbridged(), cNameLoc.unbridged(), cParensRange.unbridged(),
+      {unbridged(cKind), cKindLoc.unbridged()});
+}
+
+BridgedIsolatedTypeAttr BridgedIsolatedTypeAttr_createParsed(
+    BridgedASTContext cContext, BridgedSourceLoc cAtLoc,
+    BridgedSourceLoc cNameLoc, BridgedSourceRange cParensRange,
+
+    BridgedIsolatedTypeAttrIsolationKind cIsolation,
+    BridgedSourceLoc cIsolationLoc) {
   auto isolationKind = [=] {
     switch (cIsolation) {
     case BridgedIsolatedTypeAttrIsolationKind_DynamicIsolation:
@@ -86,8 +83,19 @@ BridgedTypeAttribute BridgedTypeAttribute_createIsolated(
     }
     llvm_unreachable("bad kind");
   }();
-  return new (cContext.unbridged())
-      IsolatedTypeAttr(cAtLoc.unbridged(), cNameLoc.unbridged(),
-                       {cLPLoc.unbridged(), cRPLoc.unbridged()},
-                       {isolationKind, cIsolationLoc.unbridged()});
+  return new (cContext.unbridged()) IsolatedTypeAttr(
+      cAtLoc.unbridged(), cNameLoc.unbridged(), cParensRange.unbridged(),
+      {isolationKind, cIsolationLoc.unbridged()});
+}
+
+BridgedOpaqueReturnTypeOfTypeAttr
+BridgedOpaqueReturnTypeOfTypeAttr_createParsed(
+    BridgedASTContext cContext, BridgedSourceLoc cAtLoc,
+    BridgedSourceLoc cKwLoc, BridgedSourceRange cParens,
+    BridgedStringRef cMangled, BridgedSourceLoc cMangledLoc, size_t index,
+    BridgedSourceLoc cIndexLoc) {
+  return new (cContext.unbridged()) OpaqueReturnTypeOfTypeAttr(
+      cAtLoc.unbridged(), cKwLoc.unbridged(), cParens.unbridged(),
+      {cMangled.unbridged(), cMangledLoc.unbridged()},
+      {static_cast<unsigned int>(index), cIndexLoc.unbridged()});
 }

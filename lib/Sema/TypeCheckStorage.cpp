@@ -2,7 +2,7 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2025 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
 // See https://swift.org/LICENSE.txt for license information
@@ -26,6 +26,7 @@
 #include "swift/AST/ASTWalker.h"
 #include "swift/AST/AvailabilityInference.h"
 #include "swift/AST/ConformanceLookup.h"
+#include "swift/AST/DeclExportabilityVisitor.h"
 #include "swift/AST/DiagnosticsParse.h"
 #include "swift/AST/DiagnosticsSema.h"
 #include "swift/AST/Expr.h"
@@ -466,36 +467,33 @@ const PatternBindingEntry *PatternBindingEntryRequest::evaluate(
     shouldRequireStatic = isa<NominalTypeDecl>(d);
   }
   for (auto *sv: vars) {
-    bool hasConst = sv->getAttrs().getAttribute<CompileTimeConstAttr>();
-    if (!hasConst)
+    bool hasUnderscoreConst = sv->getAttrs().getAttribute<CompileTimeLiteralAttr>();
+    if (!hasUnderscoreConst)
       continue;
     bool hasStatic = StaticSpelling != StaticSpellingKind::None;
     // only static _const let/var is supported
     if (shouldRequireStatic && !hasStatic) {
-      binding->diagnose(diag::require_static_for_const);
+      binding->diagnose(diag::require_static_for_literal);
       continue;
     }
     if (isReq) {
       continue;
     }
-    auto varSourceFile = binding->getDeclContext()->getParentSourceFile();
-    auto isVarInInterfaceFile =
-        varSourceFile && varSourceFile->Kind == SourceFileKind::Interface;
     // Don't diagnose too strictly for textual interfaces.
-    if (isVarInInterfaceFile) {
+    if (binding->getDeclContext()->isInSwiftinterface()) {
       continue;
     }
     // var is only allowed in a protocol.
     if (!sv->isLet()) {
-      binding->diagnose(diag::require_let_for_const);
+      binding->diagnose(diag::require_let_for_literal);
     }
     // Diagnose when an init isn't given and it's not a compile-time constant
     if (auto *init = binding->getInit(entryNumber)) {
       if (!init->isSemanticallyConstExpr()) {
-        binding->diagnose(diag::require_const_initializer_for_const);
+        binding->diagnose(diag::require_literal_initializer_for_literal);
       }
     } else {
-      binding->diagnose(diag::require_const_initializer_for_const);
+      binding->diagnose(diag::require_literal_initializer_for_literal);
     }
   }
 
@@ -621,6 +619,9 @@ static void checkAndContextualizePatternBindingInit(PatternBindingDecl *binding,
     auto *init = binding->getInit(i);
     TypeChecker::contextualizeExpr(init, initContext);
   }
+
+  // Compute captures in case diagnostics are emitted.
+  (void)binding->getCaptureInfo(i);
 }
 
 Expr *PatternBindingCheckedAndContextualizedInitRequest::evaluate(
@@ -848,6 +849,10 @@ IsSetterMutatingRequest::evaluate(Evaluator &evaluator,
 OpaqueReadOwnership
 OpaqueReadOwnershipRequest::evaluate(Evaluator &evaluator,
                                      AbstractStorageDecl *storage) const {
+  auto abiRole = ABIRoleInfo(storage);
+  if (!abiRole.providesAPI() && abiRole.getCounterpart())
+    return abiRole.getCounterpart()->getOpaqueReadOwnership();
+
   enum class DiagKind {
     BorrowedAttr,
     NoncopyableType
@@ -858,12 +863,10 @@ OpaqueReadOwnershipRequest::evaluate(Evaluator &evaluator,
     if (auto *getter = storage->getEffectfulGetAccessor()) {
       switch (kind) {
       case DiagKind::NoncopyableType:
-        getter->diagnose(diag::noncopyable_effectful_getter,
-                         getter->getDescriptiveKind());
+        getter->diagnose(diag::noncopyable_effectful_getter, getter);
         break;
       case DiagKind::BorrowedAttr:
-        getter->diagnose(diag::borrowed_with_effect,
-                         getter->getDescriptiveKind());
+        getter->diagnose(diag::borrowed_with_effect, getter);
         break;
       }
     }
@@ -949,34 +952,6 @@ buildIndexForwardingParamList(AbstractStorageDecl *storage,
   elements.append(prefix.begin(), prefix.end());
   elements.append(indices->begin(), indices->end());
   return ParameterList::create(context, elements);
-}
-
-bool AccessorDecl::doesAccessorHaveBody() const {
-  auto *accessor = this;
-  auto *storage = accessor->getStorage();
-
-  if (isa<ProtocolDecl>(accessor->getDeclContext())) {
-    if (!accessor->getASTContext().LangOpts.hasFeature(
-            Feature::CoroutineAccessors)) {
-      return false;
-    }
-    if (!requiresFeatureCoroutineAccessors(accessor->getAccessorKind())) {
-      return false;
-    }
-    if (storage->getOverrideLoc()) {
-      return false;
-    }
-    return accessor->getStorage()
-        ->requiresCorrespondingUnderscoredCoroutineAccessor(
-            accessor->getAccessorKind(), accessor);
-  }
-
-  // NSManaged getters and setters don't have bodies.
-  if (storage->getAttrs().hasAttribute<NSManagedAttr>(/*AllowInvalid=*/true))
-    if (accessor->isGetterOrSetter())
-      return false;
-
-  return true;
 }
 
 /// Build an argument list referencing the subscript parameters for this
@@ -1171,12 +1146,7 @@ static Expr *buildStorageReference(AccessorDecl *accessor,
       auto *baseClass = override->getDeclContext()->getSelfClassDecl();
       selfTypeForAccess = selfTypeForAccess->getSuperclassForDecl(baseClass);
 
-      // Error recovery path. We get an ErrorType here if getSuperclassForDecl()
-      // fails (because, for instance, a generic parameter of a generic nominal
-      // type cannot be resolved).
-      if (!selfTypeForAccess->is<ErrorType>()) {
-        subs = selfTypeForAccess->getContextSubstitutionMap(baseClass);
-      }
+      subs = selfTypeForAccess->getContextSubstitutionMap(baseClass);
 
       storage = override;
 
@@ -1462,7 +1432,7 @@ static Expr *synthesizeCopyWithZoneCall(Expr *Val, VarDecl *VD,
   //- (id)copyWithZone:(NSZone *)zone;
   DeclName copyWithZoneName(Ctx, Ctx.getIdentifier("copy"), { Ctx.Id_with });
   FuncDecl *copyMethod = nullptr;
-  for (auto member : conformance.getRequirement()->getMembers()) {
+  for (auto member : conformance.getProtocol()->getMembers()) {
     if (auto func = dyn_cast<FuncDecl>(member)) {
       if (func->getName() == copyWithZoneName) {
         copyMethod = func;
@@ -1940,7 +1910,9 @@ synthesizeObservedSetterBody(AccessorDecl *Set, TargetImpl target,
 
   auto callObserver = [&](AccessorDecl *observer, VarDecl *arg) {
     ConcreteDeclRef ref(observer, subs);
-    auto type = observer->getInterfaceType().subst(subs);
+    auto type = observer->getInterfaceType();
+    if (auto *genericFnType = type->getAs<GenericFunctionType>())
+      type = genericFnType->substGenericArgs(subs);
     Expr *Callee = new (Ctx) DeclRefExpr(ref, DeclNameLoc(), /*imp*/true);
     Callee->setType(type);
 
@@ -2131,7 +2103,9 @@ synthesizeModifyCoroutineBodyWithSimpleDidSet(AccessorDecl *accessor,
 
   auto callDidSet = [&]() {
     ConcreteDeclRef ref(DidSet, subs);
-    auto type = DidSet->getInterfaceType().subst(subs);
+    auto type = DidSet->getInterfaceType();
+    if (auto *genericFnType = type->getAs<GenericFunctionType>())
+      type = genericFnType->substGenericArgs(subs);
     Expr *Callee = new (ctx) DeclRefExpr(ref, DeclNameLoc(), /*imp*/ true);
     Callee->setType(type);
 
@@ -2631,8 +2605,7 @@ SynthesizeAccessorRequest::evaluate(Evaluator &evaluator,
     return createModify2CoroutinePrototype(storage, ctx);
 
 #define OPAQUE_ACCESSOR(ID, KEYWORD)
-#define ACCESSOR(ID) \
-  case AccessorKind::ID:
+#define ACCESSOR(ID, KEYWORD) case AccessorKind::ID:
 #include "swift/AST/AccessorKinds.def"
     llvm_unreachable("not an opaque accessor");
   }
@@ -2695,25 +2668,42 @@ RequiresOpaqueAccessorsRequest::evaluate(Evaluator &evaluator,
 ///
 /// The underscored accessor could, however, still be required for ABI
 /// stability.
-bool AbstractStorageDecl::requiresCorrespondingUnderscoredCoroutineAccessor(
-    AccessorKind kind, AccessorDecl const *decl) const {
-  auto &ctx = getASTContext();
+static bool requiresCorrespondingUnderscoredCoroutineAccessorImpl(
+    AbstractStorageDecl const *storage, AccessorKind kind,
+    AccessorDecl const *decl, AbstractStorageDecl const *derived) {
+  auto &ctx = storage->getASTContext();
   assert(ctx.LangOpts.hasFeature(Feature::CoroutineAccessors));
   assert(kind == AccessorKind::Modify2 || kind == AccessorKind::Read2);
 
+  // If any overridden decl requires the underscored version, then this decl
+  // does too.  Otherwise dispatch to the underscored version on a value
+  // statically the super but dynamically this subtype would not dispatch to an
+  // override of the underscored version but rather (incorrectly) the
+  // supertype's implementation.
+  if (storage == derived) {
+    auto *current = storage;
+    while ((current = current->getOverriddenDecl())) {
+      auto *currentDecl = cast_or_null<AccessorDecl>(
+          decl ? decl->getOverriddenDecl() : nullptr);
+      if (requiresCorrespondingUnderscoredCoroutineAccessorImpl(
+              current, kind, currentDecl, derived)) {
+        return true;
+      }
+    }
+  }
+
   // Non-stable modules have no ABI to keep stable.
-  if (getModuleContext()->getResilienceStrategy() !=
+  if (storage->getModuleContext()->getResilienceStrategy() !=
       ResilienceStrategy::Resilient)
     return false;
 
   // Non-exported storage has no ABI to keep stable.
-  if (!isExported(this))
+  if (!isExported(storage))
     return false;
 
   // The non-underscored accessor is not present, the underscored accessor
   // won't be either.
-  // TODO: CoroutineAccessors: What if only the underscored is written out?
-  auto *accessor = decl ? decl : getOpaqueAccessor(kind);
+  auto *accessor = decl ? decl : storage->getOpaqueAccessor(kind);
   if (!accessor)
     return false;
 
@@ -2724,15 +2714,41 @@ bool AbstractStorageDecl::requiresCorrespondingUnderscoredCoroutineAccessor(
   if (!ctx.supportsVersionedAvailability())
     return true;
 
-  auto modifyAvailability = TypeChecker::availabilityAtLocation({}, accessor);
-  auto featureAvailability = ctx.getCoroutineAccessorsRuntimeAvailability();
+  AvailabilityContext accessorAvailability = [&] {
+    if (storage->getModuleContext()->isMainModule()) {
+      return AvailabilityContext::forDeclSignature(accessor);
+    }
+    // Calculate the availability of the imported declaration ourselves starting
+    // from always available and constraining by walking the enclosing decl
+    // contexts.
+    auto retval = AvailabilityContext::forAlwaysAvailable(ctx);
+    auto declContext = storage->getInnermostDeclContext();
+    while (declContext) {
+      const Decl *decl = declContext->getInnermostDeclarationDeclContext();
+      if (!decl)
+        break;
+
+      retval.constrainWithDecl(decl);
+      declContext = decl->getDeclContext();
+    }
+    return retval;
+  }();
+  auto featureAvailability = ctx.getCoroutineAccessorsAvailability();
   // If accessor was introduced only after the feature was, there's no old ABI
   // to maintain.
-  if (modifyAvailability.getPlatformRange().isContainedIn(featureAvailability))
+  if (accessorAvailability.getPlatformRange().isContainedIn(
+          featureAvailability))
     return false;
 
   // The underscored accessor is required for ABI stability.
   return true;
+}
+
+bool AbstractStorageDecl::requiresCorrespondingUnderscoredCoroutineAccessor(
+    AccessorKind kind, AccessorDecl const *decl) const {
+  return requiresCorrespondingUnderscoredCoroutineAccessorImpl(
+      this, kind, decl,
+      /*derived=*/this);
 }
 
 bool RequiresOpaqueModifyCoroutineRequest::evaluate(
@@ -2799,6 +2815,11 @@ IsAccessorTransparentRequest::evaluate(Evaluator &evaluator,
     return true;
 
   if (accessor->getAttrs().hasAttribute<TransparentAttr>())
+    return true;
+
+  // Default implementations of read2 and modify2 provided for back-deployment
+  // are transparent.
+  if (accessor->isRequirementWithSynthesizedDefaultImplementation())
     return true;
 
   if (!accessor->isImplicit())
@@ -2876,7 +2897,7 @@ IsAccessorTransparentRequest::evaluate(Evaluator &evaluator,
         }
       }
 
-      if (auto subscript = dyn_cast<SubscriptDecl>(storage)) {
+      if (isa<SubscriptDecl>(storage)) {
         break;
       }
 
@@ -2974,9 +2995,10 @@ LazyStoragePropertyRequest::evaluate(Evaluator &evaluator,
   addMemberToContextIfNeeded(PBD, VD->getDeclContext(), Storage);
 
   // Make sure the original init is marked as subsumed.
-  auto *originalPBD = VD->getParentPatternBinding();
-  auto originalIndex = originalPBD->getPatternEntryIndexForVarDecl(VD);
-  originalPBD->setInitializerSubsumed(originalIndex);
+  if (auto *originalPBD = VD->getParentPatternBinding()) {
+    auto originalIndex = originalPBD->getPatternEntryIndexForVarDecl(VD);
+    originalPBD->setInitializerSubsumed(originalIndex);
+  }
 
   return Storage;
 }
@@ -3625,14 +3647,12 @@ static void finishNSManagedImplInfo(VarDecl *var,
   if (var->isLet())
     diagnoseAttrWithRemovalFixIt(var, attr, diag::attr_NSManaged_let_property);
 
-  SourceFile *parentFile = var->getDeclContext()->getParentSourceFile();
-
   auto diagnoseNotStored = [&](unsigned kind) {
     // Skip diagnosing @NSManaged declarations in module interfaces. They are
     // properties that are stored, but have specially synthesized observers
     // and we should allow them to have getters and setters in a module
     // interface.
-    if (parentFile && parentFile->Kind == SourceFileKind::Interface)
+    if (var->getDeclContext()->isInSwiftinterface())
       return;
 
     diagnoseAttrWithRemovalFixIt(var, attr, diag::attr_NSManaged_not_stored, kind);
@@ -3760,6 +3780,11 @@ static StorageImplInfo classifyWithHasStorageAttr(VarDecl *var) {
 
 bool HasStorageRequest::evaluate(Evaluator &evaluator,
                                  AbstractStorageDecl *storage) const {
+  // ABI decl inherits this from API.
+  auto abiRole = ABIRoleInfo(storage);
+  if (!abiRole.providesAPI() && abiRole.getCounterpart())
+    return abiRole.getCounterpart()->hasStorage();
+
   // Parameters are always stored.
   if (isa<ParamDecl>(storage))
     return true;
@@ -3770,8 +3795,12 @@ bool HasStorageRequest::evaluate(Evaluator &evaluator,
     return false;
 
   // @_hasStorage implies that it... has storage.
-  if (var->getAttrs().hasAttribute<HasStorageAttr>())
-    return true;
+  if (var->getAttrs().hasAttribute<HasStorageAttr>()) {
+    // Except in contexts where it would be invalid. This is diagnosed in
+    // StorageImplInfoRequest.
+    return !isa<ProtocolDecl, ExtensionDecl, EnumDecl>(
+               storage->getDeclContext()->getImplementedObjCContext());
+  }
 
   // Protocol requirements never have storage.
   if (isa<ProtocolDecl>(storage->getDeclContext()))
@@ -3845,7 +3874,11 @@ void HasStorageRequest::cacheResult(bool hasStorage) const {
     return;
   
   if (auto varDecl = dyn_cast<VarDecl>(decl)) {
-    if (hasStorage && !varDecl->getAttrs().hasAttribute<HasStorageAttr>())
+    auto abiRole = ABIRoleInfo(varDecl);
+    bool abiOnly = !abiRole.providesAPI() && abiRole.getCounterpart();
+
+    if (hasStorage && !abiOnly &&
+          !varDecl->getAttrs().hasAttribute<HasStorageAttr>())
       varDecl->getAttrs().add(new (varDecl->getASTContext())
                               HasStorageAttr(/*isImplicit=*/true));
   }
@@ -3854,6 +3887,10 @@ void HasStorageRequest::cacheResult(bool hasStorage) const {
 StorageImplInfo
 StorageImplInfoRequest::evaluate(Evaluator &evaluator,
                                  AbstractStorageDecl *storage) const {
+  auto abiRole = ABIRoleInfo(storage);
+  if (!abiRole.providesAPI() && abiRole.getCounterpart())
+    return abiRole.getCounterpart()->getImplInfo();
+
   if (auto *param = dyn_cast<ParamDecl>(storage)) {
     return StorageImplInfo::getSimpleStored(
       param->isImmutableInFunctionBody()
@@ -3861,10 +3898,20 @@ StorageImplInfoRequest::evaluate(Evaluator &evaluator,
         : StorageIsMutable);
   }
 
-  if (auto *var = dyn_cast<VarDecl>(storage)) {
+  // If we're in an @implementation extension, we care about the semantics of
+  // the decl it implements.
+  auto *DC = storage->getDeclContext()->getImplementedObjCContext();
+
+  if (auto attr = storage->getParsedAttrs().getAttribute<HasStorageAttr>()) {
+    // If we see `@_hasStorage` in a context with no stored properties, diagnose
+    // and ignore it.
+    if (isa<ExtensionDecl, EnumDecl, ProtocolDecl>(DC)) {
+      storage->diagnose(diag::attr_invalid_in_context, attr, DC->getAsDecl())
+          .warnInSwiftInterface(storage->getDeclContext());
+
     // Allow the @_hasStorage attribute to override all the accessors we parsed
     // when making the final classification.
-    if (var->getParsedAttrs().hasAttribute<HasStorageAttr>()) {
+    } else if (auto *var = dyn_cast<VarDecl>(storage)) {
       // The SIL rules for @_hasStorage are slightly different from the non-SIL
       // rules. In SIL mode, @_hasStorage marks that the type is simply stored,
       // and the only thing that determines mutability is the existence of the
@@ -3959,7 +4006,6 @@ StorageImplInfoRequest::evaluate(Evaluator &evaluator,
   bool hasMutableAddress = storage->getParsedAccessor(AccessorKind::MutableAddress);
   bool hasInit = storage->getParsedAccessor(AccessorKind::Init);
 
-  auto *DC = storage->getDeclContext();
   // 'get', 'read', and a non-mutable addressor are all exclusive.
   ReadImplKind readImpl;
   if (storage->getParsedAccessor(AccessorKind::Get)) {

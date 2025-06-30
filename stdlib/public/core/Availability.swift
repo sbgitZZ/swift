@@ -52,7 +52,9 @@ public func _stdlib_isOSVersionAtLeast(
 @_semantics("availability.osversion")
 @_effects(readnone)
 @_unavailableInEmbedded
+#if hasFeature(Macros)
 @_noLocks
+#endif
 public func _stdlib_isOSVersionAtLeast(
   _ major: Builtin.Word,
   _ minor: Builtin.Word,
@@ -65,7 +67,9 @@ public func _stdlib_isOSVersionAtLeast(
 @_semantics("availability.osversion")
 @_effects(readnone)
 @_alwaysEmitIntoClient
+#if hasFeature(Macros)
 @_noLocks
+#endif
 public func _stdlib_isOSVersionAtLeast_AEIC(
   _ major: Builtin.Word,
   _ minor: Builtin.Word,
@@ -110,7 +114,9 @@ public func _stdlib_isOSVersionAtLeast_AEIC(
 @_semantics("availability.osversion")
 @_effects(readnone)
 @available(macOS 10.15, iOS 13.0, *)
+#if hasFeature(Macros)
 @_noLocks
+#endif
 public func _stdlib_isVariantOSVersionAtLeast(
   _ major: Builtin.Word,
   _ minor: Builtin.Word,
@@ -153,7 +159,9 @@ public func _stdlib_isVariantOSVersionAtLeast(
 @_semantics("availability.osversion")
 @_effects(readnone)
 @_unavailableInEmbedded
+#if hasFeature(Macros)
 @_noLocks
+#endif
 public func _stdlib_isOSVersionAtLeastOrVariantVersionAtLeast(
   _ major: Builtin.Word,
   _ minor: Builtin.Word,
@@ -232,9 +240,11 @@ extension _SwiftStdlibVersion {
   public static var v6_1_0: Self { Self(_value: 0x060100) }
   @_alwaysEmitIntoClient
   public static var v6_2_0: Self { Self(_value: 0x060200) }
+  @_alwaysEmitIntoClient
+  public static var v6_3_0: Self { Self(_value: 0x060300) }
 
   @available(SwiftStdlib 5.7, *)
-  public static var current: Self { .v6_2_0 }
+  public static var current: Self { .v6_3_0 }
 }
 
 @available(SwiftStdlib 5.7, *)

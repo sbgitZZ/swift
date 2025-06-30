@@ -79,11 +79,11 @@ bool ASTNode::isImplicit() const {
     return D->isImplicit();
   if (const auto *P = this->dyn_cast<Pattern*>())
     return P->isImplicit();
-  if (const auto *T = this->dyn_cast<TypeRepr*>())
+  if (this->is<TypeRepr *>())
     return false;
-  if (const auto *C = this->dyn_cast<StmtConditionElement *>())
+  if (this->is<StmtConditionElement *>())
     return false;
-  if (const auto *I = this->dyn_cast<CaseLabelItem *>())
+  if (this->is<CaseLabelItem *>())
     return false;
   llvm_unreachable("unsupported AST node");
 }
@@ -124,9 +124,9 @@ void ASTNode::dump(raw_ostream &OS, unsigned Indent) const {
     P->dump(OS, Indent);
   else if (auto T = dyn_cast<TypeRepr*>())
     T->print(OS);
-  else if (auto *C = dyn_cast<StmtConditionElement *>())
+  else if (is<StmtConditionElement *>())
     OS.indent(Indent) << "(statement condition)";
-  else if (auto *I = dyn_cast<CaseLabelItem *>()) {
+  else if (is<CaseLabelItem *>()) {
     OS.indent(Indent) << "(case label item)";
   } else
     llvm_unreachable("unsupported AST node");
@@ -157,3 +157,29 @@ FUNC(Expr)
 FUNC(Decl)
 FUNC(Pattern)
 #undef FUNC
+
+SourceRange swift::getUnexpandedMacroRange(const SourceManager &SM,
+                                           SourceRange range) {
+  unsigned bufferID = SM.findBufferContainingLoc(range.Start);
+  SourceRange outerRange;
+  while (const auto *info = SM.getGeneratedSourceInfo(bufferID)) {
+    switch (info->kind) {
+#define MACRO_ROLE(Name, Description)                                          \
+  case GeneratedSourceInfo::Name##MacroExpansion:
+#include "swift/Basic/MacroRoles.def"
+      if (auto *customAttr = info->attachedMacroCustomAttr)
+        outerRange = customAttr->getRange();
+      else
+        outerRange =
+            ASTNode::getFromOpaqueValue(info->astNode).getSourceRange();
+      bufferID = SM.findBufferContainingLoc(outerRange.Start);
+      continue;
+    case GeneratedSourceInfo::ReplacedFunctionBody:
+    case GeneratedSourceInfo::PrettyPrinted:
+    case GeneratedSourceInfo::DefaultArgument:
+    case GeneratedSourceInfo::AttributeFromClang:
+      return SourceRange();
+    }
+  }
+  return outerRange;
+}

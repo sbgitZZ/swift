@@ -109,6 +109,7 @@ EXPECTED_DEFAULTS = {
     'test_indexstoredb_sanitize_all': False,
     'test_sourcekitlsp_sanitize_all': False,
     'build_sourcekitlsp': False,
+    'sourcekitlsp_verify_generated_files': False,
     'sourcekitlsp_lint': False,
     'install_llvm': False,
     'install_static_linux_config': False,
@@ -121,7 +122,6 @@ EXPECTED_DEFAULTS = {
     'swiftsyntax_verify_generated_files': False,
     'swiftsyntax_enable_rawsyntax_validation': False,
     'swiftsyntax_enable_test_fuzzing': False,
-    'swiftsyntax_lint': False,
     'install_playgroundsupport': False,
     'install_sourcekitlsp': False,
     'install_swiftformat': False,
@@ -187,6 +187,7 @@ EXPECTED_DEFAULTS = {
     'swift_enable_backtracing': True,
     'enable_synchronization': True,
     'enable_volatile': True,
+    'enable_runtime_module': True,
     'enable_lsan': False,
     'enable_sanitize_coverage': False,
     'disable_guaranteed_normal_arguments': False,
@@ -196,10 +197,13 @@ EXPECTED_DEFAULTS = {
     'enable_ubsan': False,
     'export_compile_commands': False,
     'extra_cmake_options': [],
+    'extra_llvm_cmake_options': [],
     'extra_swift_args': [],
+    'extra_swift_cmake_options': [],
     'swift_debuginfo_non_lto_args': None,
     'force_optimized_typechecker': False,
     'foundation_build_variant': 'Debug',
+    'foundation_tests_build_variant': 'Debug',
     'host_cc': None,
     'host_cxx': None,
     'host_libtool': None,
@@ -269,6 +273,7 @@ EXPECTED_DEFAULTS = {
     'swift_profile_instr_use': None,
     'swift_runtime_fixed_backtracer_path': None,
     'swift_stdlib_assertions': True,
+    'swift_stdlib_strict_availability': False,
     'swift_stdlib_build_variant': 'Debug',
     'swift_tools_ld64_lto_codegen_only_for_supporting_targets': False,
     'swift_tools_max_parallel_lto_link_jobs':
@@ -291,7 +296,6 @@ EXPECTED_DEFAULTS = {
     'test_cygwin': False,
     'test_freebsd': False,
     'test_ios': False,
-    'test_watchos_32bit_simulator': False,
     'test_ios_host': False,
     'test_ios_simulator': False,
     'test_linux': False,
@@ -334,6 +338,8 @@ EXPECTED_DEFAULTS = {
     'xros_all': False,
     'llvm_install_components': defaults.llvm_install_components(),
     'clean_install_destdir': False,
+    'use_linker': None,
+    'enable_new_runtime_build': False,
 }
 
 
@@ -547,7 +553,12 @@ EXPECTED_OPTIONS = [
     SetOption('--skip-test-early-swift-driver',
               dest='test_early_swift_driver', value=False),
 
-    SetFalseOption('--no-llvm-include-tests', dest='llvm_include_tests'),
+    SetOption('--swift-stdlib-strict-availability', value=True),
+    SetOption('--no-swift-stdlib-strict-availability',
+              dest='swift_stdlib_strict_availability', value=False),
+
+    DisableOption('--no-llvm-include-tests', dest='llvm_include_tests'),
+    EnableOption('--llvm-include-tests', dest='llvm_include_tests'),
 
     SetTrueOption('--install-back-deploy-concurrency',
                   dest='install_backdeployconcurrency'),
@@ -628,6 +639,7 @@ EXPECTED_OPTIONS = [
     EnableOption('--enable-experimental-observation'),
     EnableOption('--enable-experimental-parser-validation'),
     EnableOption('--enable-lsan'),
+    EnableOption('--enable-runtime-module'),
     EnableOption('--enable-sanitize-coverage'),
     EnableOption('--enable-tsan'),
     EnableOption('--enable-tsan-runtime'),
@@ -650,6 +662,8 @@ EXPECTED_OPTIONS = [
     EnableOption('--sourcekit-lsp', dest='build_sourcekitlsp'),
     EnableOption('--test-sourcekit-lsp-sanitize-all',
                  dest='test_sourcekitlsp_sanitize_all'),
+    EnableOption('--sourcekit-lsp-verify-generated-files',
+                 dest='sourcekitlsp_verify_generated_files'),
     EnableOption('--sourcekit-lsp-lint',
                  dest='sourcekitlsp_lint'),
     EnableOption('--install-llvm', dest='install_llvm'),
@@ -664,8 +678,6 @@ EXPECTED_OPTIONS = [
                  dest='swiftsyntax_enable_rawsyntax_validation'),
     EnableOption('--swiftsyntax-enable-test-fuzzing',
                  dest='swiftsyntax_enable_test_fuzzing'),
-    EnableOption('--swiftsyntax-lint',
-                 dest='swiftsyntax_lint'),
     EnableOption('--install-swiftpm', dest='install_swiftpm'),
     EnableOption('--install-swift-driver', dest='install_swift_driver'),
     EnableOption('--install-sourcekit-lsp', dest='install_sourcekitlsp'),
@@ -734,8 +746,6 @@ EXPECTED_OPTIONS = [
     DisableOption('--skip-test-cygwin', dest='test_cygwin'),
     DisableOption('--skip-test-freebsd', dest='test_freebsd'),
     DisableOption('--skip-test-ios', dest='test_ios'),
-    DisableOption('--skip-test-watchos-32bit-simulator',
-                  dest='test_watchos_32bit_simulator'),
     DisableOption('--skip-test-ios-host', dest='test_ios_host'),
     DisableOption('--skip-test-ios-simulator', dest='test_ios_simulator'),
     DisableOption('--skip-test-linux', dest='test_linux'),
@@ -781,6 +791,8 @@ EXPECTED_OPTIONS = [
                   choices=['false', 'not-merged', 'merged']),
     ChoicesOption('--android-arch',
                   choices=['armv7', 'aarch64', 'x86_64']),
+    ChoicesOption('--foundation-tests-build-type',
+                  dest='foundation_tests_build_variant', choices=['Debug', 'Release']),
 
     StrOption('--android-api-level'),
     StrOption('--build-args'),
@@ -801,6 +813,7 @@ EXPECTED_OPTIONS = [
     StrOption('--swift-darwin-module-archs'),
     StrOption('--swift-darwin-supported-archs'),
     SetTrueOption('--swift-freestanding-is-darwin'),
+    AppendOption('--extra-swift-cmake-options'),
 
     StrOption('--linux-archs'),
     StrOption('--linux-static-archs'),
@@ -851,6 +864,7 @@ EXPECTED_OPTIONS = [
     AppendOption('--llvm-ninja-targets'),
     AppendOption('--llvm-ninja-targets-for-cross-compile-hosts'),
     AppendOption('--llvm-cmake-options'),
+    AppendOption('--extra-llvm-cmake-options'),
     AppendOption('--darwin-symroot-path-filters'),
 
     UnsupportedOption('--build-jobs'),
@@ -889,4 +903,6 @@ EXPECTED_OPTIONS = [
     IgnoreOption('--xros-all'),
 
     StrOption('--llvm-install-components'),
+    ChoicesOption('--use-linker', dest='use_linker', choices=['gold', 'lld']),
+    EnableOption('--enable-new-runtime-build', dest='enable_new_runtime_build'),
 ]

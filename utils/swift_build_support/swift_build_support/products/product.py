@@ -217,6 +217,12 @@ class Product(object):
         return targets.toolchain_path(install_destdir,
                                       self.args.install_prefix)
 
+    def native_clang_tools_path(self, host_target):
+        if self.args.native_clang_tools_path is not None:
+            return os.path.split(self.args.native_clang_tools_path)[0]
+        else:
+            return self.install_toolchain_path(host_target)
+
     def native_toolchain_path(self, host_target):
         if self.args.native_swift_tools_path is not None:
             return os.path.split(self.args.native_swift_tools_path)[0]
@@ -379,7 +385,7 @@ class Product(object):
     def get_linux_sysroot(self, platform, arch):
         if not self.is_cross_compile_target('{}-{}'.format(platform, arch)):
             return None
-        sysroot_arch, abi = self.get_linux_target_components(arch)
+        sysroot_arch, _, abi = self.get_linux_target_components(arch)
         # $ARCH-$PLATFORM-$ABI
         # E.x.: aarch64-linux-gnu
         sysroot_dirname = '{}-{}-{}'.format(sysroot_arch, platform, abi)
@@ -389,7 +395,7 @@ class Product(object):
         sysroot_arch, vendor, abi = self.get_linux_target_components(arch)
         return '{}-{}-linux-{}'.format(sysroot_arch, vendor, abi)
 
-    def generate_linux_toolchain_file(self, platform, arch):
+    def generate_linux_toolchain_file(self, platform, arch, crosscompiling=True):
         """
         Generates a new CMake tolchain file that specifies Linux as a target
         platform.
@@ -402,8 +408,9 @@ class Product(object):
 
         toolchain_args = {}
 
-        toolchain_args['CMAKE_SYSTEM_NAME'] = 'Linux'
-        toolchain_args['CMAKE_SYSTEM_PROCESSOR'] = arch
+        if crosscompiling:
+            toolchain_args['CMAKE_SYSTEM_NAME'] = 'Linux'
+            toolchain_args['CMAKE_SYSTEM_PROCESSOR'] = arch
 
         # We only set the actual sysroot if we are actually cross
         # compiling. This is important since otherwise cmake seems to change the

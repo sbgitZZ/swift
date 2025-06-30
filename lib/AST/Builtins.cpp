@@ -442,7 +442,7 @@ enum class BuiltinThrowsKind : uint8_t {
 static FuncDecl *getBuiltinGenericFunction(
     Identifier Id, ArrayRef<AnyFunctionType::Param> ArgParamTypes, Type ResType,
     GenericParamList *GenericParams, GenericSignature Sig, bool Async,
-    BuiltinThrowsKind Throws, bool SendingResult) {
+    BuiltinThrowsKind Throws, Type ThrownError, bool SendingResult) {
   assert(GenericParams && "Missing generic parameters");
   auto &Context = ResType->getASTContext();
 
@@ -471,7 +471,7 @@ static FuncDecl *getBuiltinGenericFunction(
       Context, StaticSpellingKind::None, Name,
       /*NameLoc=*/SourceLoc(),
       Async,
-      Throws != BuiltinThrowsKind::None, /*thrownType=*/Type(),
+      Throws != BuiltinThrowsKind::None, ThrownError,
       GenericParams, paramList, ResType, DC);
 
   func->setSendingResult(SendingResult);
@@ -696,6 +696,7 @@ namespace {
     Type InterfaceResult;
     bool Async = false;
     BuiltinThrowsKind Throws = BuiltinThrowsKind::None;
+    Type ThrownError;
     bool SendingResult = false;
 
     // Accumulate params and requirements here, so that we can call
@@ -741,6 +742,11 @@ namespace {
     }
 
     template <class G>
+    void setThrownError(const G &generator) {
+      ThrownError = generator.build(*this);
+    }
+
+    template <class G>
     void addConformanceRequirement(const G &generator, KnownProtocolKind kp) {
       addConformanceRequirement(generator, Context.getProtocol(kp));
     }
@@ -776,7 +782,7 @@ namespace {
           /*allowInverses=*/false);
       return getBuiltinGenericFunction(name, InterfaceParams, InterfaceResult,
                                        TheGenericParamList, GenericSig, Async,
-                                       Throws, SendingResult);
+                                       Throws, ThrownError, SendingResult);
     }
 
     // Don't use these generator classes directly; call the make{...}
@@ -1102,8 +1108,8 @@ static ValueDecl *getIsOptionalOperation(ASTContext &ctx, Identifier id) {
 
 static ValueDecl *getIsSameMetatypeOperation(ASTContext &ctx, Identifier id) {
   return getBuiltinFunction(ctx, id, _thin,
-                            _parameters(_existentialMetatype(_any),
-                                        _existentialMetatype(_any)),
+                            _parameters(_existentialMetatype(_unconstrainedAny),
+                                        _existentialMetatype(_unconstrainedAny)),
                             _int(1));
 }
 
@@ -1131,6 +1137,8 @@ static ValueDecl *getStackDeallocOperation(ASTContext &ctx, Identifier id) {
                             _void);
 }
 
+// Obsolete: only there to be able to read old Swift.interface files which still
+// contain the builtin.
 static ValueDecl *getAllocVectorOperation(ASTContext &ctx, Identifier id) {
   return getBuiltinFunction(ctx, id, _thin,
                             _generics(_unrestricted),
@@ -1565,6 +1573,7 @@ static ValueDecl *getCreateTask(ASTContext &ctx, Identifier id) {
                                 _existential(_taskExecutor),
                                 /*else*/ _executor))),
                             _nil)),
+          _label("taskName", _defaulted(_optional(_rawPointer), _nil)),
           _label("operation",
                  _sending(_function(_async(_throws(_thick)), _typeparam(0),
                                     _parameters())))),
@@ -1589,6 +1598,7 @@ static ValueDecl *getCreateDiscardingTask(ASTContext &ctx, Identifier id) {
                                 _existential(_taskExecutor),
                                 /*else*/ _executor))),
                             _nil)),
+          _label("taskName", _defaulted(_optional(_rawPointer), _nil)),
           _label("operation", _sending(_function(_async(_throws(_thick)), _void,
                                                  _parameters())))),
       _tuple(_nativeObject, _rawPointer));
@@ -1984,6 +1994,26 @@ static ValueDecl *getInsertElementOperation(ASTContext &Context, Identifier Id,
   return getBuiltinFunction(Id, ArgElts, VecTy);
 }
 
+static ValueDecl *getSelectOperation(ASTContext &Context, Identifier Id,
+                                     Type PredTy, Type ValueTy) {
+  // Check for (NxInt1, NxTy, NxTy) -> NxTy
+  auto VecPredTy = PredTy->getAs<BuiltinVectorType>();
+  if (VecPredTy) {
+    // ValueTy must also be vector type with matching element count.
+    auto VecValueTy = ValueTy->getAs<BuiltinVectorType>();
+    if (!VecValueTy ||
+        VecPredTy->getNumElements() != VecValueTy->getNumElements())
+      return nullptr;
+  } else {
+    // Type is (Int1, Ty, Ty) -> Ty
+    auto IntTy = PredTy->getAs<BuiltinIntegerType>();
+    if (!IntTy || !IntTy->isFixedWidth() || IntTy->getFixedWidth() != 1)
+      return nullptr;
+  }
+  Type ArgElts[] = { PredTy, ValueTy, ValueTy };
+  return getBuiltinFunction(Id, ArgElts, ValueTy);
+}
+
 static ValueDecl *getShuffleVectorOperation(ASTContext &Context, Identifier Id,
                                  Type FirstTy, Type SecondTy) {
   // (Vector<N, T>, Vector<N, T>, Vector<M, Int32) -> Vector<M, T>
@@ -2002,6 +2032,38 @@ static ValueDecl *getShuffleVectorOperation(ASTContext &Context, Identifier Id,
   Type ArgElts[] = { VecTy, VecTy, IndexTy };
   Type ResultTy = BuiltinVectorType::get(Context, ElementTy,
                                          IndexTy->getNumElements());
+  return getBuiltinFunction(Id, ArgElts, ResultTy);
+}
+
+static ValueDecl *getInterleaveOperation(ASTContext &Context, Identifier Id,
+                                         Type FirstTy) {
+  // (Vector<N,T>, Vector<N,T>) -> (Vector<N,T>, Vector<N,T>)
+  auto VecTy = FirstTy->getAs<BuiltinVectorType>();
+  // Require even length because we don't need anything else to support Swift's
+  // SIMD types and it saves us from having to define what happens for odd
+  // lengths until we actually need to care about them.
+  if (!VecTy || VecTy->getNumElements() % 2 != 0)
+    return nullptr;
+  
+  Type ArgElts[] = { VecTy, VecTy };
+  TupleTypeElt ResultElts[] = { FirstTy, FirstTy };
+  Type ResultTy = TupleType::get(ResultElts, Context);
+  return getBuiltinFunction(Id, ArgElts, ResultTy);
+}
+
+static ValueDecl *getDeinterleaveOperation(ASTContext &Context, Identifier Id,
+                                           Type FirstTy) {
+  // (Vector<N,T>, Vector<N,T>) -> (Vector<N,T>, Vector<N,T>)
+  auto VecTy = FirstTy->getAs<BuiltinVectorType>();
+  // Require even length because we don't need anything else to support Swift's
+  // SIMD types and it saves us from having to define what happens for odd
+  // lengths until we actually need to care about them.
+  if (!VecTy || VecTy->getNumElements() % 2 != 0)
+    return nullptr;
+  
+  Type ArgElts[] = { VecTy, VecTy };
+  TupleTypeElt ResultElts[] = { FirstTy, FirstTy };
+  Type ResultTy = TupleType::get(ResultElts, Context);
   return getBuiltinFunction(Id, ArgElts, ResultTy);
 }
 
@@ -2231,17 +2293,31 @@ static ValueDecl *getAddressOfRawLayout(ASTContext &ctx, Identifier id) {
 }
 
 static ValueDecl *getEmplace(ASTContext &ctx, Identifier id) {
-  BuiltinFunctionBuilder builder(ctx, /* genericParamCount */ 1);
+  BuiltinFunctionBuilder builder(ctx, /* genericParamCount */ 2);
 
-  auto T = makeGenericParam();
+  // <T: ~Copyable, E: Error>(
+  //   _: (Builtin.RawPointer) throws(E) -> ()
+  // ) throws(E) -> T
+
+  auto T = makeGenericParam(0);
   builder.addConformanceRequirement(T, KnownProtocolKind::Escapable);
+
+  auto E = makeGenericParam(1);
+  builder.addConformanceRequirement(E, KnownProtocolKind::Error);
+
+  auto extInfo = ASTExtInfoBuilder()
+      .withNoEscape()
+      .withThrows(/* throws */ true, E.build(builder))
+      .build();
 
   auto fnParamTy = FunctionType::get(FunctionType::Param(ctx.TheRawPointerType),
                                      ctx.TheEmptyTupleType,
-                                     ASTExtInfo().withNoEscape());
+                                     extInfo);
 
   builder.addParameter(makeConcrete(fnParamTy), ParamSpecifier::Borrowing);
   builder.setResult(T);
+  builder.setThrows();
+  builder.setThrownError(E);
 
   return builder.build(id);
 }
@@ -3088,6 +3164,7 @@ ValueDecl *swift::getBuiltinValueDecl(ASTContext &Context, Identifier Id) {
     return getUnreachableOperation(Context, Id);
       
   case BuiltinValueKind::ZeroInitializer:
+  case BuiltinValueKind::PrepareInitialization:
     return getZeroInitializerOperation(Context, Id);
       
   case BuiltinValueKind::Once:
@@ -3108,10 +3185,22 @@ ValueDecl *swift::getBuiltinValueDecl(ASTContext &Context, Identifier Id) {
   case BuiltinValueKind::InsertElement:
     if (Types.size() != 3) return nullptr;
     return getInsertElementOperation(Context, Id, Types[0], Types[1], Types[2]);
+    
+  case BuiltinValueKind::Select:
+    if (Types.size() != 2) return nullptr;
+    return getSelectOperation(Context, Id, Types[0], Types[1]);
       
   case BuiltinValueKind::ShuffleVector:
     if (Types.size() != 2) return nullptr;
     return getShuffleVectorOperation(Context, Id, Types[0], Types[1]);
+    
+  case BuiltinValueKind::Interleave:
+    if (Types.size() != 1) return nullptr;
+    return getInterleaveOperation(Context, Id, Types[0]);
+    
+  case BuiltinValueKind::Deinterleave:
+    if (Types.size() != 1) return nullptr;
+    return getDeinterleaveOperation(Context, Id, Types[0]);
 
   case BuiltinValueKind::StaticReport:
     if (!Types.empty()) return nullptr;

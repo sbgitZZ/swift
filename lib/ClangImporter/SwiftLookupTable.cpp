@@ -14,13 +14,14 @@
 // modules.
 //
 //===----------------------------------------------------------------------===//
-#include "ImporterImpl.h"
 #include "SwiftLookupTable.h"
+#include "ImporterImpl.h"
 #include "swift/AST/DiagnosticEngine.h"
 #include "swift/AST/DiagnosticsClangImporter.h"
 #include "swift/Basic/Assertions.h"
 #include "swift/Basic/STLExtras.h"
 #include "swift/Basic/Version.h"
+#include "swift/ClangImporter/ClangImporter.h"
 #include "clang/AST/DeclCXX.h"
 #include "clang/AST/DeclObjC.h"
 #include "clang/Lex/MacroInfo.h"
@@ -29,8 +30,8 @@
 #include "clang/Serialization/ASTBitCodes.h"
 #include "clang/Serialization/ASTReader.h"
 #include "clang/Serialization/ASTWriter.h"
-#include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/Bitcode/BitcodeConvenience.h"
 #include "llvm/Bitstream/BitstreamReader.h"
@@ -83,14 +84,18 @@ class SwiftLookupTableWriter : public clang::ModuleFileExtensionWriter {
   importer::ClangSourceBufferImporter &buffersForDiagnostics;
   const PlatformAvailability &availability;
 
+  ClangImporter::Implementation *importerImpl;
+
 public:
   SwiftLookupTableWriter(
       clang::ModuleFileExtension *extension, clang::ASTWriter &writer,
       ASTContext &ctx,
       importer::ClangSourceBufferImporter &buffersForDiagnostics,
-      const PlatformAvailability &avail)
-    : ModuleFileExtensionWriter(extension), Writer(writer), swiftCtx(ctx),
-      buffersForDiagnostics(buffersForDiagnostics), availability(avail) {}
+      const PlatformAvailability &avail,
+      ClangImporter::Implementation *importerImpl)
+      : ModuleFileExtensionWriter(extension), Writer(writer), swiftCtx(ctx),
+        buffersForDiagnostics(buffersForDiagnostics), availability(avail),
+        importerImpl(importerImpl) {}
 
   void writeExtensionContents(clang::Sema &sema,
                               llvm::BitstreamWriter &stream) override;
@@ -214,7 +219,7 @@ bool SwiftLookupTable::contextRequiresName(ContextKind kind) {
 
 /// Try to translate the given Clang declaration into a context.
 static std::optional<SwiftLookupTable::StoredContext>
-translateDeclToContext(clang::NamedDecl *decl) {
+translateDeclToContext(const clang::NamedDecl *decl) {
   // Tag declaration.
   if (auto tag = dyn_cast<clang::TagDecl>(decl)) {
     if (tag->getIdentifier())
@@ -319,22 +324,46 @@ SwiftLookupTable::translateContext(EffectiveClangContext context) {
 
 /// Lookup an unresolved context name and resolve it to a Clang
 /// declaration context or typedef name.
-clang::NamedDecl *SwiftLookupTable::resolveContext(StringRef unresolvedName) {
+const clang::NamedDecl *
+SwiftLookupTable::resolveContext(StringRef unresolvedName) {
+  SmallVector<StringRef, 1> nameComponents;
+  unresolvedName.split(nameComponents, '.');
+
+  EffectiveClangContext parentContext;
+
   // Look for a context with the given Swift name.
-  for (auto entry :
-       lookup(SerializedSwiftName(unresolvedName),
-              std::make_pair(ContextKind::TranslationUnit, StringRef()))) {
-    if (auto decl = entry.dyn_cast<clang::NamedDecl *>()) {
-      if (isa<clang::TagDecl>(decl) ||
-          isa<clang::ObjCInterfaceDecl>(decl) ||
-          isa<clang::TypedefNameDecl>(decl))
-        return decl;
+  for (auto nameComponent : nameComponents) {
+    auto entries =
+        parentContext
+            ? lookup(SerializedSwiftName(nameComponent), parentContext)
+            : lookup(SerializedSwiftName(nameComponent),
+                     std::make_pair(ContextKind::TranslationUnit, StringRef()));
+    bool entryFound = false;
+    for (auto entry : entries) {
+      if (auto decl = entry.dyn_cast<clang::NamedDecl *>()) {
+        if (isa<clang::TagDecl>(decl) ||
+            isa<clang::ObjCInterfaceDecl>(decl) ||
+            isa<clang::NamespaceDecl>(decl)) {
+          entryFound = true;
+          parentContext = EffectiveClangContext(cast<clang::DeclContext>(decl));
+          break;
+        }
+        if (auto typedefDecl = dyn_cast<clang::TypedefNameDecl>(decl)) {
+          entryFound = true;
+          parentContext = EffectiveClangContext(typedefDecl);
+          break;
+        }
+      }
     }
+
+    // If we could not resolve this component of the qualified name, bail.
+    if (!entryFound)
+      return nullptr;
   }
 
-  // FIXME: Search imported modules to resolve the context.
-
-  return nullptr;
+  return parentContext.getAsDeclContext()
+             ? cast<clang::NamedDecl>(parentContext.getAsDeclContext())
+             : parentContext.getTypedefName();
 }
 
 void SwiftLookupTable::addCategory(clang::ObjCCategoryDecl *category) {
@@ -1282,12 +1311,13 @@ namespace {
       }
     }
   };
+
 } // end anonymous namespace
 
 void SwiftLookupTableWriter::writeExtensionContents(
        clang::Sema &sema,
        llvm::BitstreamWriter &stream) {
-  NameImporter nameImporter(swiftCtx, availability, sema);
+  NameImporter nameImporter(swiftCtx, availability, sema, importerImpl);
 
   // Populate the lookup table.
   SwiftLookupTable table(nullptr);
@@ -1543,6 +1573,7 @@ namespace {
       return result;
     }
   };
+
 } // end anonymous namespace
 
 clang::NamedDecl *SwiftLookupTable::mapStoredDecl(StoredSingleEntry &entry) {
@@ -1652,6 +1683,7 @@ SwiftLookupTableReader::create(clang::ModuleFileExtension *extension,
   std::unique_ptr<SerializedGlobalsAsMembersIndex> globalsAsMembersIndex;
   std::unique_ptr<SerializedGlobalsAsMembersTable> globalsAsMembersTable;
   ArrayRef<clang::serialization::DeclID> categories;
+
   while (next.Kind != llvm::BitstreamEntry::EndBlock) {
     if (next.Kind == llvm::BitstreamEntry::Error)
       return nullptr;
@@ -1863,9 +1895,9 @@ SwiftNameLookupExtension::hashExtension(ExtensionHashBuilder &HBuilder) const {
 void importer::addEntryToLookupTable(SwiftLookupTable &table,
                                      clang::NamedDecl *named,
                                      NameImporter &nameImporter) {
+  auto &clangContext = nameImporter.getClangContext();
   clang::PrettyStackTraceDecl trace(
-      named, named->getLocation(),
-      nameImporter.getClangContext().getSourceManager(),
+      named, named->getLocation(), clangContext.getSourceManager(),
       "while adding SwiftName lookup table entries for clang declaration");
 
   // Determine whether this declaration is suppressed in Swift.
@@ -2176,7 +2208,7 @@ std::unique_ptr<clang::ModuleFileExtensionWriter>
 SwiftNameLookupExtension::createExtensionWriter(clang::ASTWriter &writer) {
   return std::make_unique<SwiftLookupTableWriter>(this, writer, swiftCtx,
                                                   buffersForDiagnostics,
-                                                  availability);
+                                                  availability, importerImpl);
 }
 
 std::unique_ptr<clang::ModuleFileExtensionReader>

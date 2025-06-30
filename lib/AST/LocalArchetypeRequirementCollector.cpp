@@ -183,13 +183,18 @@ Type MapLocalArchetypesOutOfContext::getInterfaceType(
     ++depth;
   }
 
-  llvm::errs() << "Fell off the end:\n";
-  interfaceTy->dump(llvm::errs());
-  abort();
+  ABORT([&](auto &out) {
+    out << "Fell off the end:\n";
+    interfaceTy->dump(out);
+  });
 }
 
 Type MapLocalArchetypesOutOfContext::operator()(SubstitutableType *type) const {
-  auto *archetypeTy = cast<ArchetypeType>(type);
+  // Local archetypes can appear in interface types alongside generic param
+  // types, ignore them here.
+  auto *archetypeTy = dyn_cast<ArchetypeType>(type);
+  if (!archetypeTy)
+    return type;
 
   // Primary archetypes just map out of context.
   if (isa<PrimaryArchetypeType>(archetypeTy) ||
@@ -262,10 +267,10 @@ swift::buildSubstitutionMapWithCapturedEnvironments(
         return mapIntoLocalContext(param, baseDepth, capturedEnvs);
       return Type(type).subst(baseSubMap);
     },
-    [&](CanType origType, Type substType,
-        ProtocolDecl *proto) -> ProtocolConformanceRef {
+    [&](InFlightSubstitution &IFS, Type origType, ProtocolDecl *proto)
+          -> ProtocolConformanceRef {
       if (origType->getRootGenericParam()->getDepth() >= baseDepth)
-        return ProtocolConformanceRef::forAbstract(substType, proto);
-      return baseSubMap.lookupConformance(origType, proto);
+        return ProtocolConformanceRef::forAbstract(origType.subst(IFS), proto);
+      return baseSubMap.lookupConformance(origType->getCanonicalType(), proto);
     });
 }

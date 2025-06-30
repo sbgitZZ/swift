@@ -2,7 +2,7 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2020 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2025 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
 // See https://swift.org/LICENSE.txt for license information
@@ -20,7 +20,6 @@
 
 #include "swift/Basic/CXXStdlibKind.h"
 #include "swift/Basic/Feature.h"
-#include "swift/Basic/FixedBitSet.h"
 #include "swift/Basic/FunctionBodySkipping.h"
 #include "swift/Basic/LLVM.h"
 #include "swift/Basic/PlaygroundOption.h"
@@ -46,6 +45,7 @@ namespace swift {
 
   struct DiagnosticBehavior;
   class DiagnosticEngine;
+  class FrontendOptions;
 
   /// Kind of implicit platform conditions.
   enum class PlatformConditionKind {
@@ -95,6 +95,11 @@ namespace swift {
   enum class ConcurrencyModel : uint8_t {
     Standard,
     TaskToThread,
+  };
+
+  enum class DefaultIsolation : uint8_t {
+    MainActor,
+    Nonisolated
   };
 
   /// Describes the code size optimization behavior for code associated with
@@ -149,6 +154,7 @@ namespace swift {
     /// The lowering triple may result in multiple versions of the same Clang
     /// modules being built.
     std::optional<llvm::Triple> ClangTarget;
+    std::optional<llvm::Triple> ClangTargetVariant;
 
     /// The SDK version, if known.
     std::optional<llvm::VersionTuple> SDKVersion;
@@ -201,7 +207,7 @@ namespace swift {
     /// Maximum number of typo corrections we are allowed to perform.
     /// This is disabled by default until we can get typo-correction working within acceptable performance bounds.
     unsigned TypoCorrectionLimit = 0;
-    
+
     /// Should access control be respected?
     bool EnableAccessControl = true;
 
@@ -260,7 +266,7 @@ namespace swift {
 
     /// Emit a remark when indexing a system module.
     bool EnableIndexingSystemModuleRemarks = false;
-    
+
     /// Emit a remark on early exit in explicit interface build
     bool EnableSkipExplicitInterfaceModuleBuildRemarks = false;
 
@@ -315,6 +321,8 @@ namespace swift {
     /// Flags for use by tests
     ///
 
+    bool UseStaticStandardLibrary = false;
+
     /// Enable Objective-C Runtime interop code generation and build
     /// configuration options.
     bool EnableObjCInterop = true;
@@ -329,8 +337,13 @@ namespace swift {
     /// to the Swift language version.
     version::Version cxxInteropCompatVersion;
 
+    /// What version of C++ interoperability a textual interface was originally
+    /// generated with (if at all).
+    std::optional<version::Version> FormalCxxInteropMode;
+
     void setCxxInteropFromArgs(llvm::opt::ArgList &Args,
-                               swift::DiagnosticEngine &Diags);
+                               swift::DiagnosticEngine &Diags,
+                               const FrontendOptions &FrontendOpts);
 
     /// The C++ standard library used for the current build. This can differ
     /// from the default C++ stdlib on a particular platform when `-Xcc
@@ -411,19 +424,12 @@ namespace swift {
     /// implementation quirk of previous compilers.
     bool DisableNamedLazyImportAsMemberLoading = false;
 
-    /// Enable inference of Sendable conformances for public types.
-    bool EnableInferPublicSendable = false;
-
     /// Disable the implicit import of the _Concurrency module.
     bool DisableImplicitConcurrencyModuleImport =
         !SWIFT_IMPLICIT_CONCURRENCY_IMPORT;
 
     /// Disable the implicit import of the _StringProcessing module.
     bool DisableImplicitStringProcessingModuleImport = false;
-
-    /// Disable the implicit import of the _Backtracing module.
-    bool DisableImplicitBacktracingModuleImport =
-        !SWIFT_IMPLICIT_BACKTRACING_IMPORT;
 
     /// Disable the implicit import of the Cxx module.
     bool DisableImplicitCxxModuleImport = false;
@@ -574,9 +580,17 @@ namespace swift {
     /// algorithm.
     unsigned RequirementMachineMaxRuleLength = 12;
 
-    /// Maximum concrete type nesting depth for requirement machine property map
-    /// algorithm.
+    /// Maximum concrete type nesting depth (when type is viewed as a tree) for
+    /// requirement machine property map algorithm.
     unsigned RequirementMachineMaxConcreteNesting = 30;
+
+    /// Maximum concrete type size (total number of nodes in the type tree) for
+    /// requirement machine property map algorithm.
+    unsigned RequirementMachineMaxConcreteSize = 4000;
+
+    /// Maximum number of "type difference" structures for the requirement machine
+    /// property map algorithm.
+    unsigned RequirementMachineMaxTypeDifferences = 4000;
 
     /// Maximum number of attempts to make when splitting concrete equivalence
     /// classes.
@@ -601,7 +615,7 @@ namespace swift {
     bool EnableRequirementMachineOpaqueArchetypes = false;
 
     /// Enable implicit lifetime dependence for ~Escapable return types.
-    bool EnableExperimentalLifetimeDependenceInference = true;
+    bool EnableExperimentalLifetimeDependenceInference = false;
 
     /// Skips decls that cannot be referenced externally.
     bool SkipNonExportableDecls = false;
@@ -609,6 +623,12 @@ namespace swift {
     /// True if -allow-non-resilient-access is passed and built
     /// from source.
     bool AllowNonResilientAccess = false;
+
+    /// When Package CMO is enabled, deserialization checks ensure that a decl's
+    /// members are correctly deserialized to maintain the proper layout—a prerequisite
+    /// for bypassing resilience when accessing the decl. By default, a warning is issued
+    /// if a deserialization failure is found; this flag causes the build to fail fast instead.
+    bool AbortOnDeserializationFailForPackageCMO = false;
 
     /// Enables dumping type witness systems from associated type inference.
     bool DumpTypeWitnessSystems = false;
@@ -628,6 +648,9 @@ namespace swift {
 
     /// Disables `DynamicActorIsolation` feature.
     bool DisableDynamicActorIsolation = false;
+
+    /// Defines the default actor isolation.
+    DefaultIsolation DefaultIsolationBehavior = DefaultIsolation::Nonisolated;
 
     /// Whether or not to allow experimental features that are only available
     /// in "production".
@@ -684,7 +707,7 @@ namespace swift {
     void clearAllPlatformConditionValues() {
       PlatformConditionValues.clear();
     }
-    
+
     /// Returns the value for the given platform condition or an empty string.
     StringRef getPlatformConditionValue(PlatformConditionKind Kind) const;
 
@@ -725,19 +748,6 @@ namespace swift {
                                           unsigned minor = 0) const {
       return cxxInteropCompatVersion.isVersionAtLeast(major, minor);
     }
-
-    /// Determine whether the given feature is enabled.
-    bool hasFeature(Feature feature) const;
-
-    /// Determine whether the given feature is enabled, looking up the feature
-    /// by name.
-    bool hasFeature(llvm::StringRef featureName) const;
-
-    /// Enable the given feature.
-    void enableFeature(Feature feature) { Features.insert(feature); }
-
-    /// Disable the given feature.
-    void disableFeature(Feature feature) { Features.remove(feature); }
 
     /// Sets the "_hasAtomicBitWidth" conditional.
     void setHasAtomicBitWidth(llvm::Triple triple);
@@ -809,6 +819,8 @@ namespace swift {
         hashValue = llvm::hash_combine(hashValue, TargetVariant.value().str());
       if (ClangTarget.has_value())
         hashValue = llvm::hash_combine(hashValue, ClangTarget.value().str());
+      if (ClangTargetVariant.has_value())
+        hashValue = llvm::hash_combine(hashValue, ClangTargetVariant.value().str());
       if (SDKVersion.has_value())
         hashValue = llvm::hash_combine(hashValue, SDKVersion.value().getAsString());
       if (VariantSDKVersion.has_value())
@@ -823,10 +835,75 @@ namespace swift {
         PlatformConditionValues;
     llvm::SmallVector<std::string, 2> CustomConditionalCompilationFlags;
 
-    /// The set of features that have been enabled. Doesn't include upcoming
-    /// features, which are checked against the language version in
-    /// `hasFeature`.
-    FixedBitSet<numFeatures(), Feature> Features;
+  public:
+    //==========================================================================
+    // MARK: Features
+    //==========================================================================
+
+    /// A wrapper around the feature state enumeration.
+    struct FeatureState {
+      enum class Kind : uint8_t { Off, EnabledForMigration, Enabled };
+
+    private:
+      Feature feature;
+      Kind state;
+
+    public:
+      FeatureState(Feature feature, Kind state)
+          : feature(feature), state(state) {}
+
+      /// Returns whether the feature is enabled.
+      bool isEnabled() const;
+
+      /// Returns whether the feature is enabled in migration mode. Should only
+      /// be called if the feature is known to support this mode.
+      bool isEnabledForMigration() const;
+
+      operator Kind() const { return state; }
+    };
+
+  private:
+    class FeatureStateStorage {
+      std::vector<FeatureState::Kind> states;
+
+    public:
+      FeatureStateStorage();
+
+      /// Sets the given state for the given feature.
+      void setState(Feature feature, FeatureState::Kind state);
+
+      /// Retrieves the state of the given feature.
+      FeatureState getState(Feature feature) const;
+    };
+
+    /// The states of language features.
+    FeatureStateStorage featureStates;
+
+  public:
+    /// Retrieve the state of the given feature.
+    FeatureState getFeatureState(Feature feature) const;
+
+    /// Returns whether the given feature is enabled.
+    ///
+    /// If allowMigration is set, also returns true when the feature has been
+    /// enabled for migration.
+    bool hasFeature(Feature feature, bool allowMigration = false) const;
+
+    /// Returns whether a feature with the given name is enabled. Returns
+    /// `false` if a feature by this name is not known.
+    bool hasFeature(llvm::StringRef featureName) const;
+
+    /// Returns whether the given feature is enabled for migration.
+    bool isMigratingToFeature(Feature feature) const;
+
+    /// Enables the given feature (enables in migration mode if `forMigration`
+    /// is `true`).
+    void enableFeature(Feature feature, bool forMigration = false);
+
+    /// Disables the given feature.
+    void disableFeature(Feature feature);
+
+    // =========================================================================
   };
 
   class TypeCheckerOptions final {
@@ -845,7 +922,7 @@ namespace swift {
 
     /// If non-zero, abort the expression type checker if it takes more
     /// than this many seconds.
-    unsigned ExpressionTimeoutThreshold = 600;
+    unsigned ExpressionTimeoutThreshold = 0;
 
     /// The upper bound, in bytes, of temporary data that can be
     /// allocated by the constraint solver.
@@ -864,7 +941,7 @@ namespace swift {
     /// 4.2 GHz Intel Core i7.
     /// (It's arbitrary, but will keep the compiler from taking too much time.)
     unsigned SwitchCheckingInvocationThreshold = 200000;
-    
+
     /// If true, the time it takes to type-check each function will be dumped
     /// to llvm::errs().
     bool DebugTimeFunctionBodies = false;
@@ -906,16 +983,9 @@ namespace swift {
     /// is for testing purposes.
     std::vector<std::string> DebugForbidTypecheckPrefixes;
 
-    /// The upper bound to number of sub-expressions unsolved
-    /// before termination of the shrink phrase of the constraint solver.
-    unsigned SolverShrinkUnsolvedThreshold = 10;
-
-    /// Disable the shrink phase of the expression type checker.
-    bool SolverDisableShrink = false;
-
     /// Enable experimental operator designated types feature.
     bool EnableOperatorDesignatedTypes = false;
-    
+
     /// Disable constraint system performance hacks.
     bool DisableConstraintSolverPerformanceHacks = false;
 
@@ -928,6 +998,9 @@ namespace swift {
     /// Allow request evalutation to perform type checking lazily, instead of
     /// eagerly typechecking source files after parsing.
     bool EnableLazyTypecheck = false;
+
+    /// Disable the component splitter phase of the expression type checker.
+    bool SolverDisableSplitter = false;
   };
 
   /// Options for controlling the behavior of the Clang importer.
@@ -959,6 +1032,9 @@ namespace swift {
 
     /// The bridging header or PCH that will be imported.
     std::string BridgingHeader;
+
+    /// The bridging header PCH file.
+    std::string BridgingHeaderPCH;
 
     /// When automatically generating a precompiled header from the bridging
     /// header, place it in this directory.
@@ -1033,12 +1109,6 @@ namespace swift {
     /// built and provided to the compiler invocation.
     bool DisableImplicitClangModules = false;
 
-    /// Enable ClangIncludeTree for explicit module builds scanning.
-    bool UseClangIncludeTree = false;
-
-    /// Using ClangIncludeTreeRoot for compilation.
-    bool HasClangIncludeTreeRoot = false;
-
     /// Whether the dependency scanner should construct all swift-frontend
     /// invocations directly from clang cc1 args.
     bool ClangImporterDirectCC1Scan = false;
@@ -1081,6 +1151,9 @@ namespace swift {
     /// compilation source targets.
     std::vector<std::string>
     getReducedExtraArgsForSwiftModuleDependency() const;
+
+    /// Get PCH input path. Return empty string if there is no PCH input.
+    std::string getPCHInputPath() const;
   };
 
 } // end namespace swift

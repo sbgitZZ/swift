@@ -114,7 +114,7 @@ class CodeCompletionCallbacksImpl : public CodeCompletionCallbacks,
   SourceLoc DotLoc;
   TypeLoc ParsedTypeLoc;
   DeclContext *CurDeclContext = nullptr;
-  CustomSyntaxAttributeKind AttrKind;
+  ParameterizedDeclAttributeKind AttrKind;
 
   /// When the code completion token occurs in a custom attribute, the attribute
   /// it occurs in. Used so we can complete inside the attribute even if it's
@@ -272,7 +272,7 @@ public:
   void completeCaseStmtKeyword() override;
   void completeCaseStmtBeginning(CodeCompletionExpr *E) override;
   void completeDeclAttrBeginning(bool Sil, bool isIndependent) override;
-  void completeDeclAttrParam(CustomSyntaxAttributeKind DK, int Index,
+  void completeDeclAttrParam(ParameterizedDeclAttributeKind DK, int Index,
                              bool HasLabel) override;
   void completeEffectsSpecifier(bool hasAsync, bool hasThrows) override;
   void completeInPrecedenceGroup(
@@ -283,6 +283,7 @@ public:
 
   void completePoundAvailablePlatform() override;
   void completeImportDecl(ImportPath::Builder &Path) override;
+  void completeUsingDecl() override;
   void completeUnresolvedMember(CodeCompletionExpr *E,
                                 SourceLoc DotLoc) override;
   void completeCallArg(CodeCompletionExpr *E) override;
@@ -302,7 +303,8 @@ public:
   void completeGenericRequirement() override;
   void completeAfterIfStmtElse() override;
   void completeStmtLabel(StmtKind ParentKind) override;
-  void completeForEachPatternBeginning(bool hasTry, bool hasAwait) override;
+  void completeForEachPatternBeginning(
+      bool hasTry, bool hasAwait, bool hasUnsafe) override;
   void completeTypeAttrBeginning() override;
   void completeTypeAttrInheritanceBeginning() override;
   void completeOptionalBinding() override;
@@ -459,7 +461,7 @@ void CodeCompletionCallbacksImpl::completeTypeSimpleBeginning() {
 }
 
 void CodeCompletionCallbacksImpl::completeDeclAttrParam(
-    CustomSyntaxAttributeKind DK, int Index, bool HasLabel) {
+    ParameterizedDeclAttributeKind DK, int Index, bool HasLabel) {
   Kind = CompletionKind::AttributeDeclParen;
   AttrKind = DK;
   AttrParamIndex = Index;
@@ -549,6 +551,11 @@ void CodeCompletionCallbacksImpl::completeImportDecl(
   Path.pop_back();
 }
 
+void CodeCompletionCallbacksImpl::completeUsingDecl() {
+  Kind = CompletionKind::Using;
+  CurDeclContext = P.CurDeclContext;
+}
+
 void CodeCompletionCallbacksImpl::completeUnresolvedMember(CodeCompletionExpr *E,
     SourceLoc DotLoc) {
   Kind = CompletionKind::UnresolvedMember;
@@ -636,7 +643,7 @@ void CodeCompletionCallbacksImpl::completeStmtLabel(StmtKind ParentKind) {
 }
 
 void CodeCompletionCallbacksImpl::completeForEachPatternBeginning(
-    bool hasTry, bool hasAwait) {
+    bool hasTry, bool hasAwait, bool hasUnsafe) {
   CurDeclContext = P.CurDeclContext;
   Kind = CompletionKind::ForEachPatternBeginning;
   ParsedKeywords.clear();
@@ -644,6 +651,8 @@ void CodeCompletionCallbacksImpl::completeForEachPatternBeginning(
     ParsedKeywords.emplace_back("try");
   if (hasAwait)
     ParsedKeywords.emplace_back("await");
+  if (hasUnsafe)
+    ParsedKeywords.emplace_back("unsafe");
 }
 
 void CodeCompletionCallbacksImpl::completeOptionalBinding() {
@@ -987,6 +996,7 @@ void CodeCompletionCallbacksImpl::addKeywords(CodeCompletionResultSink &Sink,
   case CompletionKind::AttributeBegin:
   case CompletionKind::PoundAvailablePlatform:
   case CompletionKind::Import:
+  case CompletionKind::Using:
   case CompletionKind::UnresolvedMember:
   case CompletionKind::AfterPoundExpr:
   case CompletionKind::AfterPoundDirective:
@@ -1912,7 +1922,10 @@ void CodeCompletionCallbacksImpl::doneParsing(SourceFile *SrcFile) {
       Lookup.addImportModuleNames();
     break;
   }
-
+  case CompletionKind::Using: {
+    Lookup.addUsingSpecifiers();
+    break;
+  }
   case CompletionKind::AfterPoundDirective: {
     addPoundDirectives(CompletionContext.getResultSink());
 

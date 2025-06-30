@@ -51,6 +51,10 @@
 using namespace swift;
 using namespace Lowering;
 
+llvm::cl::list<std::string> PrintFunctionAST(
+    "print-function-ast", llvm::cl::CommaSeparated,
+    llvm::cl::desc("Only print out the ast for this function"));
+
 //===----------------------------------------------------------------------===//
 // SILGenModule Class implementation
 //===----------------------------------------------------------------------===//
@@ -223,8 +227,7 @@ static FuncDecl *diagnoseMissingIntrinsic(SILGenModule &sgm,
 
 #define KNOWN_SDK_FUNC_DECL(MODULE, NAME, ID)                                  \
   FuncDecl *SILGenModule::get##NAME(SILLocation loc) {                         \
-    if (ModuleDecl *M = getASTContext().getLoadedModule(                       \
-            getASTContext().Id_##MODULE)) {                                    \
+    if (getASTContext().getLoadedModule(getASTContext().Id_##MODULE)) {        \
       if (auto fn = getASTContext().get##NAME())                               \
         return fn;                                                             \
     }                                                                          \
@@ -459,6 +462,10 @@ FuncDecl *SILGenModule::getDeinitOnExecutor() {
   return lookupConcurrencyIntrinsic(getASTContext(), "_deinitOnExecutor");
 }
 
+FuncDecl *SILGenModule::getCreateExecutors() {
+  return lookupConcurrencyIntrinsic(getASTContext(), "_createExecutors");
+}
+
 FuncDecl *SILGenModule::getExit() {
   ASTContext &C = getASTContext();
 
@@ -506,6 +513,29 @@ FuncDecl *SILGenModule::getExit() {
   }
 
   return exitFunction;
+}
+
+Type SILGenModule::getConfiguredExecutorFactory() {
+  auto &ctx = getASTContext();
+
+  // Look in the main module for a typealias
+  Type factory = ctx.getNamedSwiftType(ctx.MainModule, "DefaultExecutorFactory");
+
+  // If we don't find it, fall back to _Concurrency.PlatformExecutorFactory
+  if (!factory)
+    factory = getDefaultExecutorFactory();
+
+  return factory;
+}
+
+Type SILGenModule::getDefaultExecutorFactory() {
+  auto &ctx = getASTContext();
+
+  ModuleDecl *module = ctx.getModuleByIdentifier(ctx.Id_Concurrency);
+  if (!module)
+    return Type();
+
+  return ctx.getNamedSwiftType(module, "DefaultExecutorFactory");
 }
 
 ProtocolConformance *SILGenModule::getNSErrorConformanceToError() {
@@ -663,9 +693,11 @@ static bool shouldEmitFunctionBody(const AbstractFunctionDecl *AFD) {
     return false;
 
   auto &ctx = AFD->getASTContext();
-  if (ctx.TypeCheckerOpts.EnableLazyTypecheck) {
+  if (ctx.TypeCheckerOpts.EnableLazyTypecheck || AFD->isInMacroExpansionFromClangHeader()) {
     // Force the function body to be type-checked and then skip it if there
-    // have been any errors.
+    // have been any errors. Normally macro expansions are type checked in the module they
+    // expand in - this does not apply to swift macros applied to nodes imported from clang,
+    // so force type checking of them here if they haven't already, to prevent crashing.
     (void)AFD->getTypecheckedBody();
 
     // FIXME: Only skip bodies that contain type checking errors.
@@ -737,6 +769,13 @@ static ActorIsolation getActorIsolationForFunction(SILFunction &fn) {
       // Deallocating destructor is always nonisolated. Isolation of the deinit
       // applies only to isolated deallocator and destroyer.
       return ActorIsolation::forNonisolated(false);
+    }
+
+    // If we have a closure expr, check if our type is
+    // nonisolated(nonsending). In that case, we use that instead.
+    if (auto *closureExpr = constant.getAbstractClosureExpr()) {
+      if (auto actorIsolation = closureExpr->getActorIsolation())
+        return actorIsolation;
     }
 
     // If we have actor isolation for our constant, put the isolation onto the
@@ -842,6 +881,22 @@ void SILGenModule::visit(Decl *D) {
     return;
 
   ASTVisitor::visit(D);
+}
+
+static bool isInPrintFunctionList(AbstractFunctionDecl *fd) {
+  if (PrintFunctionAST.empty()) {
+    return false;
+  }
+  auto fnName = SILDeclRef(fd).mangle();
+  for (const std::string &printFnName : PrintFunctionAST) {
+    if (printFnName == fnName)
+      return true;
+    if (!printFnName.empty() && printFnName[0] != '$' && !fnName.empty() &&
+        fnName[0] == '$' && printFnName == fnName.substr(1)) {
+      return true;
+    }
+  }
+  return false;
 }
 
 void SILGenModule::visitFuncDecl(FuncDecl *fd) { emitFunction(fd); }
@@ -1400,14 +1455,19 @@ void SILGenModule::emitDifferentiabilityWitness(
   auto *diffWitness = M.lookUpDifferentiabilityWitness(key);
   if (!diffWitness) {
     // Differentiability witnesses have the same linkage as the original
-    // function, stripping external.
-    auto linkage = stripExternalFromLinkage(originalFunction->getLinkage());
+    // function, stripping external. For @_alwaysEmitIntoClient original
+    // functions, force PublicNonABI linkage of the differentiability witness so
+    // we can serialize it (the original function itself might be HiddenExternal
+    // in this case if we only have declaration without definition).
+    auto linkage =
+        originalFunction->markedAsAlwaysEmitIntoClient()
+            ? SILLinkage::PublicNonABI
+            : stripExternalFromLinkage(originalFunction->getLinkage());
     diffWitness = SILDifferentiabilityWitness::createDefinition(
         M, linkage, originalFunction, diffKind, silConfig.parameterIndices,
         silConfig.resultIndices, config.derivativeGenericSignature,
         /*jvp*/ nullptr, /*vjp*/ nullptr,
-        /*isSerialized*/ hasPublicVisibility(originalFunction->getLinkage()),
-        attr);
+        /*isSerialized*/ hasPublicVisibility(linkage), attr);
   }
 
   // Set derivative function in differentiability witness.
@@ -1437,8 +1497,16 @@ void SILGenModule::emitDifferentiabilityWitness(
 }
 
 void SILGenModule::emitAbstractFuncDecl(AbstractFunctionDecl *AFD) {
+  if (isInPrintFunctionList(AFD)) {
+    auto &out = llvm::errs();
+    AFD->dump(out);
+  }
+  
   // Emit default arguments and property wrapper initializers.
   emitArgumentGenerators(AFD, AFD->getParameters());
+
+  ASSERT(ABIRoleInfo(AFD).providesAPI()
+            && "emitAbstractFuncDecl() on ABI-only decl?");
 
   // If the declaration is exported as a C function, emit its native-to-foreign
   // thunk too, if it wasn't already forced.
@@ -1595,7 +1663,7 @@ void SILGenModule::emitObjCAllocatorDestructor(ClassDecl *cd,
   // Emit the isolated deallocating destructor.
   // If emitted, it implements actual deallocating and deallocating destructor
   // only switches executor
-  if (dd->hasBody() && isActorIsolated) {
+  if (dd->hasBody() && !dd->isBodySkipped() && isActorIsolated) {
     SILDeclRef dealloc(dd, SILDeclRef::Kind::IsolatedDeallocator);
     emitFunctionDefinition(dealloc, getFunction(dealloc, ForDefinition));
   }
@@ -1720,7 +1788,7 @@ void SILGenModule::emitDefaultArgGenerator(SILDeclRef constant,
     break;
 
   case DefaultArgumentKind::Inherited:
-#define MAGIC_IDENTIFIER(NAME, STRING, SYNTAX_KIND) \
+#define MAGIC_IDENTIFIER(NAME, STRING)                                         \
   case DefaultArgumentKind::NAME:
 #include "swift/AST/MagicIdentifierKinds.def"
   case DefaultArgumentKind::NilLiteral:
@@ -1934,7 +2002,7 @@ SILGenModule::canStorageUseStoredKeyPathComponent(AbstractStorageDecl *decl,
   auto strategy = decl->getAccessStrategy(
       AccessSemantics::Ordinary,
       decl->supportsMutation() ? AccessKind::ReadWrite : AccessKind::Read,
-      M.getSwiftModule(), expansion,
+      M.getSwiftModule(), expansion, std::nullopt,
       /*useOldABI=*/false);
   switch (strategy.getKind()) {
   case AccessStrategy::Storage: {
@@ -2032,17 +2100,16 @@ void SILGenModule::tryEmitPropertyDescriptor(AbstractStorageDecl *decl) {
   if (!SILModuleConventions(M).useLoweredAddresses())
     return;
   
-  if (!decl->exportsPropertyDescriptor())
+  auto descriptorContext = decl->getPropertyDescriptorGenericSignature();
+  if (!descriptorContext)
     return;
 
   PrettyStackTraceDecl stackTrace("emitting property descriptor for", decl);
 
   Type baseTy;
   if (decl->getDeclContext()->isTypeContext()) {
-
     baseTy = decl->getDeclContext()->getSelfInterfaceType()
-                 ->getReducedType(decl->getInnermostDeclContext()
-                                      ->getGenericSignatureOfContext());
+                 ->getReducedType(*descriptorContext);
     
     if (decl->isStatic()) {
       baseTy = MetatypeType::get(baseTy);
@@ -2053,8 +2120,7 @@ void SILGenModule::tryEmitPropertyDescriptor(AbstractStorageDecl *decl) {
     llvm_unreachable("should not export a property descriptor yet");
   }
 
-  auto genericEnv = decl->getInnermostDeclContext()
-                        ->getGenericEnvironmentOfContext();
+  auto genericEnv = descriptorContext->getGenericEnvironment();
   unsigned baseOperand = 0;
   bool needsGenericContext = true;
   
@@ -2064,8 +2130,16 @@ void SILGenModule::tryEmitPropertyDescriptor(AbstractStorageDecl *decl) {
   }
   
   SubstitutionMap subs;
-  if (genericEnv)
-    subs = genericEnv->getForwardingSubstitutionMap();
+  if (genericEnv) {
+    // The substitutions are used when invoking the underlying accessors, so
+    // we get these from the original declaration generic environment, even if
+    // `getPropertyDescriptorGenericSignature` computed a different generic
+    // environment, since the accessors will not need the extra Copyable or
+    // Escapable requirements.
+    subs = SubstitutionMap::get(decl->getInnermostDeclContext()
+                                    ->getGenericSignatureOfContext(),
+      genericEnv->getForwardingSubstitutionMap());
+  }
   
   auto component = emitKeyPathComponentForDecl(SILLocation(decl),
                                                genericEnv,
@@ -2077,10 +2151,6 @@ void SILGenModule::tryEmitPropertyDescriptor(AbstractStorageDecl *decl) {
                                                /*property descriptor*/ true);
   
   (void)SILProperty::create(M, /*serializedKind*/ 0, decl, component);
-}
-
-void SILGenModule::visitPoundDiagnosticDecl(PoundDiagnosticDecl *PDD) {
-  // Nothing to do for #error/#warning; they've already been emitted.
 }
 
 void SILGenModule::emitSourceFile(SourceFile *sf) {

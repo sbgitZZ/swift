@@ -130,7 +130,7 @@ extension SourceManager {
     fixItChanges: [FixIt.Change] = []
   ) {
     // Map severity
-    let bridgedSeverity = severity.bridged
+    let bridgedSeverity: swift.DiagnosticKind = severity.bridged
 
     // Emit the diagnostic
     var mutableMessage = message
@@ -159,17 +159,31 @@ extension SourceManager {
 
       switch change {
       case .replace(let oldNode, let newNode):
+        // Replace the whole node including leading/trailing trivia, but if
+        // the trivia are the same, don't include them in the replacing range.
+        let leadingMatch = oldNode.leadingTrivia == newNode.leadingTrivia
+        let trailingMatch = oldNode.trailingTrivia == newNode.trailingTrivia
         replaceStartLoc = bridgedSourceLoc(
           for: oldNode,
-          at: oldNode.positionAfterSkippingLeadingTrivia
+          at: leadingMatch ? oldNode.positionAfterSkippingLeadingTrivia : oldNode.position
         )
         replaceEndLoc = bridgedSourceLoc(
           for: oldNode,
-          at: oldNode.endPositionBeforeTrailingTrivia
+          at: trailingMatch ? oldNode.endPositionBeforeTrailingTrivia : oldNode.endPosition
         )
+        var newNode = newNode.detached
+        if leadingMatch {
+          newNode.leadingTrivia = []
+        }
+        if trailingMatch {
+          newNode.trailingTrivia = []
+        }
         newText = newNode.description
 
       case .replaceLeadingTrivia(let oldToken, let newTrivia):
+        guard oldToken.leadingTrivia != newTrivia else {
+          continue
+        }
         replaceStartLoc = bridgedSourceLoc(for: oldToken)
         replaceEndLoc = bridgedSourceLoc(
           for: oldToken,
@@ -178,6 +192,9 @@ extension SourceManager {
         newText = newTrivia.description
 
       case .replaceTrailingTrivia(let oldToken, let newTrivia):
+        guard oldToken.trailingTrivia != newTrivia else {
+          continue
+        }
         replaceStartLoc = bridgedSourceLoc(
           for: oldToken,
           at: oldToken.endPositionBeforeTrailingTrivia
@@ -199,6 +216,21 @@ extension SourceManager {
           at: replacementRange.upperBound
         )
         newText = replacingChildData.newChild.description
+
+      case .replaceText(
+        range: let replacementRange,
+        with: let replacementText,
+        in: let syntax
+      ):
+        replaceStartLoc = bridgedSourceLoc(
+          for: syntax,
+          at: replacementRange.lowerBound
+        )
+        replaceEndLoc = bridgedSourceLoc(
+          for: syntax,
+          at: replacementRange.upperBound
+        )
+        newText = replacementText
       }
 
       newText.withBridgedString { bridgedMessage in

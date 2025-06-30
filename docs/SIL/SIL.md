@@ -108,6 +108,56 @@ largely according to Swift's type grammar.
 sil-type ::= '$' '*'? generic-parameter-list? type
 ```
 
+## Formal vs. Lowered Types
+
+A formal type corresponds to a Swift type as it is defined in the source code.
+The AST and the type checker work with formal types. Formal types can be
+canonicalized which resolves type aliases and removes sugar. Later stages of
+the compiler, like the SIL optimizer, only deal with canonical formal types.
+Therefore, if we speak about formal types in the following sections, we always
+refer to _canonical_ formal types.
+
+Each formal type has a corresponding lowered type. However, most lowered types
+are identical to their original formal type, for example all nominal types,
+like classes, structs or enums (except `Optional`). Only a few kind of types
+are lowered to a different lowered type. The most prominent example is function
+types: a lowered function type adds information about the calling convention and 
+it lowers tuple arguments to individual arguments.
+
+For example, the formal type of
+
+```
+  func foo(a: (Int, String), b: any P) { }
+```
+
+is `((Int, String), any P) -> ()` whereas its lowered type is
+`(Int, @guaranteed String, @in_guaranteed any P) -> ()`.
+
+Deriving a lowered type from a formal type is called _type lowering_ which is
+described in detail in the [Types](Types.md#Type-Lowering) document.
+
+SIL types are always lowered types. The soundness of the SIL type system
+depends on lowered types and the SIL optimizer needs lowered types to perform
+correct optimizations.
+
+However, there are a few places where SIL needs to refer to formal types. These
+are operations on types which are "user visible", for example cast
+instructions.
+
+For example, a cast from `((Int, Bool)) -> ()` to `(Int, Bool) -> ()` fails
+because the two formal function types differ. If a SIL cast instruction would
+operate on SIL types, the cast would incorrectly succeed because the formal
+types of those functions types are equivalent.
+
+To summarize:
+
+|                    | Definition                                   | Example                             |
+| ------------------ | -------------------------------------------- | ----------------------------------- |
+| **Formal type**    | original type from the source code           | `typealias C = ((Int, Bool)) -> ()` |
+| **Canonical type** | formal type minus sugar, aliases resolved    | `((Int, Bool)) -> ()`               |
+| **SIL type**       | lowered canonical type, plus is-address flag | `$*(Int, Bool) -> ()`               |
+
+
 ## Loadable vs. Address-only Types
 
 Most SIL types are _loadable_. That means that a value of such a type can be
@@ -300,7 +350,7 @@ There are three kind of arguments:
 ```
 
 - Phi arguments: If a block has multiple predecessor blocks, the terminators of
-  the predecessor blocks must be `br` or `cond_br` instructions and the the
+  the predecessor blocks must be `br` or `cond_br` instructions and the
   operand values of those branch instructions are passed to the block's
   arguments. This corresponds to LLVM's phi nodes. Basic block arguments are
   bound by the branch from the predecessor block:
@@ -407,9 +457,10 @@ The ownership kind of a value is statically determined:
       ...
 ```
 
-- The ownership of most instruction results is statically defined. For example
-  `copy_value` always produces an owned value, whereas `begin_borrow` always
-  produces a guaranteed value.
+- The ownership of most instruction results can be statically determined from
+  the instruction's kind and the offset of the value in the result tuple. For
+  example `copy_value` has only one result and that result is always an owned
+  value, whereas `begin_borrow` always produces a guaranteed value.
 
 - Forwarding instructions: some instructions work with both, owned and
   guaranteed ownership, and "forward" the ownership from their operand(s) to
@@ -446,7 +497,7 @@ Lifetimes have following properties:
 
 - Lifetimes of guaranteed values are called _borrow scopes_. A borrow scope
   starts with a single definition - the borrow-introducer. There are only a few
-  different kind of borrow-introducers:
+  different kinds of borrow-introducers:
     - guaranteed function argument: the lifetime spans over the whole function
       and doesn't need a scope-ending use.
     - `borrowed-from` instruction: it produces a borrow scope from a [reborrow
@@ -481,7 +532,7 @@ Lifetimes have following properties:
 ```
       %1 = load [copy] %0   // producer
       %2 = copy_value %1    // interior use of %1
-      %3 = move_value %1    // consuming use of %2
+      %3 = move_value %1    // consuming use of %1
       %4 = copy_value %1    // ERROR: use of %1 outside %1's lifetime
 ```
 

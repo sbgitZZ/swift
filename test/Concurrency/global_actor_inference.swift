@@ -120,14 +120,16 @@ func testNotAllInP1(nap1: NotAllInP1) { // expected-note{{add '@SomeGlobalActor'
 // Make sure we don't infer 'nonisolated' for stored properties.
 @MainActor
 protocol Interface {
-  nonisolated var baz: Int { get } // expected-note{{'baz' declared here}}
+  nonisolated var baz: Int { get }
 }
 
+// expected-warning@+2{{conformance of 'Object' to protocol 'Interface' crosses into main actor-isolated code and can cause data races}}
 @MainActor
 class Object: Interface {
-  // expected-note@-1{{add '@preconcurrency' to the 'Interface' conformance to defer isolation checking to run time}}{{15-15=@preconcurrency }}
+  // expected-note@-1{{turn data races into runtime errors with '@preconcurrency'}}{{15-15=@preconcurrency }}
+  // expected-note@-2{{isolate this conformance to the main actor with '@MainActor'}}
 
-  var baz: Int = 42 // expected-warning{{main actor-isolated property 'baz' cannot be used to satisfy nonisolated protocol requirement}}
+  var baz: Int = 42 // expected-note{{main actor-isolated property 'baz' cannot satisfy nonisolated requirement}}
 }
 
 
@@ -280,8 +282,8 @@ class SubclassWithGlobalActors : SuperclassWithGlobalActors {
 @SomeGlobalActor func sibling() { foo() }
 
 func bar() async {
-  // expected-error@+1{{expression is 'async' but is not marked with 'await'}}{{3-3=await }}
-  foo() // expected-note{{calls to global function 'foo()' from outside of its actor context are implicitly asynchronous}}
+  // expected-error@+1{{global actor 'SomeGlobalActor'-isolated global function 'foo()' cannot be called from outside of the actor}}{{3-3=await }}
+  foo()
 }
 
 // expected-note@+1 {{add '@SomeGlobalActor' to make global function 'barSync()' part of global actor 'SomeGlobalActor'}} {{1-1=@SomeGlobalActor }}
@@ -643,8 +645,7 @@ func acceptAsyncSendableClosureInheriting<T>(@_inheritActorContext _: @Sendable 
 
 @MainActor func testCallFromMainActor() {
   acceptAsyncSendableClosure {
-    onlyOnMainActor() // expected-error{{expression is 'async' but is not marked with 'await'}}
-    // expected-note@-1 {{calls to global function 'onlyOnMainActor()' from outside of its actor context are implicitly asynchronous}}
+    onlyOnMainActor() // expected-error{{main actor-isolated global function 'onlyOnMainActor()' cannot be called from outside of the actor}} {{5-5=await }}
   }
 
   acceptAsyncSendableClosure {

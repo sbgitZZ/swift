@@ -339,11 +339,6 @@ static void printImports(raw_ostream &out,
       continue;
     }
 
-    if (llvm::count(Opts.ModulesToSkipInPublicInterface,
-                    importedModule->getName().str())) {
-      continue;
-    }
-
     llvm::SmallSetVector<Identifier, 4> spis;
     M->lookupImportedSPIGroups(importedModule, spis);
 
@@ -489,7 +484,6 @@ class InheritedProtocolCollector {
   static ProtocolConformanceOptions filterOptions(ProtocolConformanceOptions options) {
     options -= ProtocolConformanceFlags::Preconcurrency;
     options -= ProtocolConformanceFlags::Retroactive;
-    options -= ProtocolConformanceFlags::Safe;
     return options;
   }
 
@@ -710,8 +704,9 @@ public:
 
     // Preserve the behavior of previous implementations which formatted of
     // empty extensions compactly with '{}' on the same line.
-    PrintOptions extensionPrintOptions = printOptions;
-    extensionPrintOptions.PrintEmptyMembersOnSameLine = true;
+    PrintOptions::OverrideScope extensionPrintingScope(printOptions);
+    OVERRIDE_PRINT_OPTION(extensionPrintingScope,
+                          PrintEmptyMembersOnSameLine, true);
 
     // Then walk the remaining ones, and see what we need to print.
     // FIXME: This will pick the availability attributes from the first sight
@@ -750,7 +745,7 @@ public:
             !M->isImportedImplementationOnly(inherited->getParentModule())) {
           auto protoAndAvailability = ProtocolAndAvailability(
               inherited, availability, isUnchecked, otherAttrs);
-          printSynthesizedExtension(out, extensionPrintOptions, M, nominal,
+          printSynthesizedExtension(out, printOptions, M, nominal,
                                     protoAndAvailability);
           return TypeWalker::Action::SkipNode;
         }
@@ -805,8 +800,7 @@ public:
 
     ctx.evaluator.cacheOutput(ExtendedTypeRequest{extension},
                               nominal->getDeclaredType());
-    ctx.evaluator.cacheOutput(ExtendedNominalRequest{extension},
-                              const_cast<NominalTypeDecl *>(nominal));
+    extension->setExtendedNominal(const_cast<NominalTypeDecl *>(nominal));
 
     extension->print(printer, printOptions);
     printer << "\n";

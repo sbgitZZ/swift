@@ -148,6 +148,7 @@ void ASTScope::unqualifiedLookup(
   if (auto *s = SF->getASTContext().Stats)
     ++s->getFrontendCounters().NumASTScopeLookups;
 
+#if SWIFT_BUILD_SWIFT_SYNTAX
   // Perform validation of SwiftLexicalLookup if option
   // Feature::UnqualifiedLookupValidation is enabled and lookup was not
   // performed in a macro.
@@ -171,6 +172,9 @@ void ASTScope::unqualifiedLookup(
   } else {
     ASTScopeImpl::unqualifiedLookup(SF, loc, consumer);
   }
+#else
+    ASTScopeImpl::unqualifiedLookup(SF, loc, consumer);
+#endif
 }
 
 llvm::SmallVector<LabeledStmt *, 4> ASTScope::lookupLabeledStmts(
@@ -199,15 +203,10 @@ CatchNode ASTScope::lookupCatchNode(ModuleDecl *module, SourceLoc loc) {
 }
 
 #if SWIFT_COMPILER_IS_MSVC
-#pragma warning(push)
-#pragma warning(disable : 4996)
+#pragma warning(supress: 4996)
 #endif
 
 void ASTScope::dump() const { impl->dump(); }
-
-#if SWIFT_COMPILER_IS_MSVC
-#pragma warning(pop)
-#endif
 
 void ASTScope::print(llvm::raw_ostream &out) const { impl->print(out); }
 void ASTScope::dumpOneScopeMapLocation(std::pair<unsigned, unsigned> lineCol) {
@@ -298,6 +297,20 @@ NullablePtr<Expr> ASTScopeImpl::getExprIfAny() const {
   }
 }
 
+bool ASTScopeImpl::isDeclAttribute() const {
+  switch (getKind()) {
+#define DECL_ATTRIBUTE_SCOPE_NODE(Name) \
+    case ScopeKind::Name: return true;
+#define SCOPE_NODE(Name)
+#include "swift/AST/ASTScopeNodes.def"
+
+#define DECL_ATTRIBUTE_SCOPE_NODE(Name)
+#define SCOPE_NODE(Name) case ScopeKind::Name:
+#include "swift/AST/ASTScopeNodes.def"
+      return false;
+  }
+}
+
 SourceManager &ASTScopeImpl::getSourceManager() const {
   return getASTContext().SourceMgr;
 }
@@ -343,6 +356,8 @@ SourceRange NominalTypeScope::getBraces() const { return decl->getBraces(); }
 
 NullablePtr<NominalTypeDecl>
 ExtensionScope::getCorrespondingNominalTypeDecl() const {
+  if (!decl->hasBeenBound())
+    return nullptr;
   return decl->getExtendedNominal();
 }
 

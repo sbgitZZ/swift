@@ -229,6 +229,13 @@ extension ApplySite {
     functionConvention.resultDependencies != nil
   }
 
+  public func isAddressable(operand: Operand) -> Bool {
+    if let dep = resultDependence(on: operand) {
+      return dep.isAddressable(for: operand.value)
+    }
+    return false
+  }
+
   public var hasLifetimeDependence: Bool {
     functionConvention.hasLifetimeDependencies()
   }
@@ -270,15 +277,24 @@ extension ApplySite {
     return argumentOperands[callerArgIdx]
   }
 
+  /// Returns the argument of `operand` in a callee function.
+  ///
+  /// Returns nil if `operand` is not an argument operand. This is the case if
+  /// it's the callee function operand.
+  public func calleeArgument(of operand: Operand, in callee: Function) -> FunctionArgument? {
+    if let argIdx = calleeArgumentIndex(of: operand) {
+      return callee.arguments[argIdx]
+    }
+    return nil
+  }
+
   /// Returns the argument index of an operand.
   ///
-  /// Returns nil if 'operand' is not an argument operand. This is the case if
+  /// Returns nil if `operand` is not an argument operand. This is the case if
   /// it's the callee function operand.
   ///
-  /// Warning: the returned integer can be misused as an index into
-  /// the wrong collection. Replace uses of this API with safer APIs.
-  ///
-  /// TODO: delete this API and rewrite the users. 
+  /// Warning: the returned integer can be misused as an index into the wrong collection.
+  /// Use `calleeArgument(of:,in:)` if possible.
   public func calleeArgumentIndex(of operand: Operand) -> Int? {
     operandConventions.calleeArgumentIndex(of: operand)
   }
@@ -296,6 +312,7 @@ extension ApplySite {
 
 public protocol FullApplySite : ApplySite {
   var singleDirectResult: Value? { get }
+  var singleDirectErrorResult: Value? { get }
 }
 
 extension FullApplySite {

@@ -68,17 +68,10 @@ def _apply_default_arguments(args):
     # Set the default CMake generator.
     if args.cmake_generator is None:
         args.cmake_generator = 'Ninja'
-    elif args.cmake_generator == 'Xcode':
-        # Building with Xcode is deprecated.
-        args.skip_build = True
-        args.build_early_swift_driver = False
-        args.build_early_swiftsyntax = False
 
     # Set the default build variant.
     if args.build_variant is None:
-        args.build_variant = (
-            'MinSizeRel' if args.cmake_generator == 'Xcode' else 'Debug'
-        )
+        args.build_variant = 'Debug'
 
     if args.llvm_build_variant is None:
         args.llvm_build_variant = args.build_variant
@@ -100,6 +93,9 @@ def _apply_default_arguments(args):
 
     if args.foundation_build_variant is None:
         args.foundation_build_variant = args.build_variant
+
+    if args.foundation_tests_build_variant is None:
+        args.foundation_tests_build_variant = args.build_variant
 
     if args.libdispatch_build_variant is None:
         args.libdispatch_build_variant = args.build_variant
@@ -135,6 +131,9 @@ def _apply_default_arguments(args):
 
     if args.lldb_assertions is None:
         args.lldb_assertions = args.assertions
+
+    if args.swift_stdlib_strict_availability is None:
+        args.swift_stdlib_strict_availability = False
 
     # --ios-all etc are not supported by open-source Swift.
     if args.ios_all:
@@ -599,6 +598,12 @@ def create_argument_parser():
                 'will get little benefit from it (e.g. tools for '
                 'bootstrapping or debugging Swift)')
 
+    option('--extra-swift-cmake-options', append,
+           type=argparse.ShellSplitType(),
+           help='Pass additional CMake options to the Swift build. '
+                'Can be passed multiple times to add multiple options.',
+           default=[])
+
     option('--dsymutil-jobs', store_int,
            default=defaults.DSYMUTIL_JOBS,
            metavar='COUNT',
@@ -643,6 +648,12 @@ def create_argument_parser():
                 'Available modes: `hosttools`, `bootstrapping`, '
                 '`bootstrapping-with-hostlibs`, `crosscompile`, and '
                 '`crosscompile-with-hostlibs`')
+
+    option('--use-linker', store('use_linker'),
+           choices=['gold', 'lld'],
+           default=None,
+           metavar='USE_LINKER',
+           help='Choose the default linker to use when compiling LLVM/Swift')
 
     # -------------------------------------------------------------------------
     in_group('Host and cross-compilation targets')
@@ -703,6 +714,9 @@ def create_argument_parser():
 
     option('--swift-freestanding-is-darwin', toggle_true,
            help='True if the freestanding platform is a Darwin one.')
+
+    option('--enable-new-runtime-build', toggle_true,
+           help='True to enable the new runtime build.')
 
     # -------------------------------------------------------------------------
     in_group('Options to select projects')
@@ -766,6 +780,10 @@ def create_argument_parser():
     option('--test-sourcekit-lsp-sanitize-all',
            toggle_true('test_sourcekitlsp_sanitize_all'),
            help='run sourcekit-lsp tests under all sanitizers')
+    option('--sourcekit-lsp-verify-generated-files',
+           toggle_true('sourcekitlsp_verify_generated_files'),
+           help='set to verify that the generated files in the source tree ' +
+                'match the ones that would be generated from current main')
     option('--sourcekit-lsp-lint',
            toggle_true('sourcekitlsp_lint'),
            help='verify that sourcekit-lsp Source code is formatted correctly')
@@ -784,9 +802,6 @@ def create_argument_parser():
            help='set to validate that RawSyntax layout nodes contain children of ' +
                 'the expected types and that RawSyntax tokens have the expected ' +
                 'token kinds')
-    option('--swiftsyntax-lint',
-           toggle_true('swiftsyntax_lint'),
-           help='verify that swift-syntax Source code is formatted correctly')
     option(['--install-sourcekit-lsp'], toggle_true('install_sourcekitlsp'),
            help='install SourceKitLSP')
     option(['--install-swiftformat'], toggle_true('install_swiftformat'),
@@ -849,7 +864,7 @@ def create_argument_parser():
            help='install playground support')
 
     option('--build-ninja', toggle_true,
-           help='build the Ninja tool')
+           help='build the Ninja tool [deprecated: Ninja is built when necessary]')
 
     option(['--build-lld'], toggle_true('build_lld'), default=True,
            help='build lld as part of llvm')
@@ -952,6 +967,12 @@ def create_argument_parser():
            const='Debug',
            help='build the Debug variant of Foundation')
 
+    option('--foundation-tests-build-type', store('foundation_tests_build_variant'),
+           choices=['Debug', 'Release'],
+           default=None,
+           help='build the Foundation tests in a certain variant '
+                '(Debug builds much faster)')
+
     option('--debug-libdispatch', store('libdispatch_build_variant'),
            const='Debug',
            help='build the Debug variant of libdispatch')
@@ -1026,6 +1047,14 @@ def create_argument_parser():
            const=False,
            help='disable assertions in llbuild')
 
+    option('--swift-stdlib-strict-availability', store,
+           const=True,
+           help='enable strict availability checking in the Swift standard library (you want this OFF for CI or at-desk builds)')
+    option('--no-swift-stdlib-strict-availability',
+           store('swift_stdlib_strict_availability'),
+           const=False,
+           help='disable strict availability checking in the Swift standard library (you want this OFF for CI or at-desk builds)')
+
     # -------------------------------------------------------------------------
     in_group('Select the CMake generator')
 
@@ -1037,9 +1066,11 @@ def create_argument_parser():
     option(['-m', '--make'], store('cmake_generator'),
            const='Unix Makefiles',
            help="use CMake's Makefile generator (%(default)s by default)")
+
+    # Xcode generation is no longer supported, leave the option so we can
+    # inform the user.
     option(['-x', '--xcode'], store('cmake_generator'),
-           const='Xcode',
-           help="use CMake's Xcode generator (%(default)s by default)")
+           const='Xcode', help=argparse.SUPPRESS)
 
     # -------------------------------------------------------------------------
     in_group('Run tests')
@@ -1268,10 +1299,6 @@ def create_argument_parser():
     option('--skip-test-ios-simulator',
            toggle_false('test_ios_simulator'),
            help='skip testing iOS simulator targets')
-    option('--skip-test-watchos-32bit-simulator',
-           toggle_false('test_watchos_32bit_simulator'),
-           default=False,
-           help='skip testing watchOS 32 bit simulator targets')
     option('--skip-test-ios-host',
            toggle_false('test_ios_host'),
            help='skip testing iOS device targets on the host machine (the '
@@ -1394,14 +1421,27 @@ def create_argument_parser():
                 'Can be called multiple times '
                 'to add multiple such options.')
 
-    option('--no-llvm-include-tests', toggle_false('llvm_include_tests'),
-           help='do not generate testing targets for LLVM')
+    with mutually_exclusive_group():
+        set_defaults(llvm_include_tests=True)
+
+        option('--no-llvm-include-tests', toggle_false('llvm_include_tests'),
+               help='do not generate testing targets for LLVM')
+
+        option('--llvm-include-tests', toggle_true('llvm_include_tests'),
+               help='generate testing targets for LLVM')
 
     option('--llvm-cmake-options', append,
            type=argparse.ShellSplitType(),
            help='CMake options used for llvm in the form of comma '
                 'separated options "-DCMAKE_VAR1=YES,-DCMAKE_VAR2=/tmp". Can '
                 'be called multiple times to add multiple such options.')
+    option('--extra-llvm-cmake-options', append,
+           type=argparse.ShellSplitType(),
+           help='Pass additional CMake options to the LLVM build. '
+                'Can be passed multiple times to add multiple options. '
+                'These are the last arguments passed to CMake and can override '
+                'existing options.',
+           default=[])
 
     # -------------------------------------------------------------------------
     in_group('Build settings for Android')
@@ -1488,6 +1528,10 @@ def create_argument_parser():
     option('--enable-volatile', toggle_true,
            default=True,
            help='Enable Volatile module.')
+
+    option('--enable-runtime-module', toggle_true,
+           default=True,
+           help='Enable Runtime module.')
 
     option('--enable-experimental-parser-validation', toggle_true,
            default=True,
@@ -1665,10 +1709,6 @@ To run OS X and iOS tests that don't require a device:
 To use 'make' instead of 'ninja', use '-m':
 
   [~/src/s]$ ./swift/utils/build-script -m -R
-
-To create Xcode projects that can build Swift, use '-x':
-
-  [~/src/s]$ ./swift/utils/build-script -x -R
 
 Preset mode in build-script
 ---------------------------

@@ -12,11 +12,7 @@ function(swift_configure_lit_site_cfg source_path destination_path installed_nam
   string(REPLACE ${CMAKE_CFG_INTDIR} ${SWIFT_BUILD_MODE} LLVM_TOOLS_DIR ${LLVM_TOOLS_BINARY_DIR})
   string(REPLACE ${CMAKE_CFG_INTDIR} ${SWIFT_BUILD_MODE} LLVM_LIBS_DIR  ${LLVM_LIBRARY_DIR})
 
-  if (XCODE)
-    string(REPLACE ${CMAKE_CFG_INTDIR} Debug LIT_SWIFTLIB_DIR ${SWIFTLIB_DIR})
-  else ()
-    set(LIT_SWIFTLIB_DIR ${SWIFTLIB_DIR})
-  endif ()
+  set(LIT_SWIFTLIB_DIR ${SWIFTLIB_DIR})
 
   configure_file("${source_path}" "${destination_path}" @ONLY)
 
@@ -82,6 +78,14 @@ function(get_test_dependencies SDK result_var_name)
 
   set(deps_binaries)
 
+  if (SWIFT_BUILD_LIBEXEC AND SWIFT_ENABLE_BACKTRACING)
+    # Only add if `swift-backtrace` builds for this SDK
+    if (TARGET "swift-backtrace-${SDK}")
+      list(APPEND deps_binaries
+        "swift-backtrace-${SDK}")
+    endif()
+  endif()
+
   if (SWIFT_INCLUDE_TOOLS)
     list(APPEND deps_binaries
       libMockPlugin
@@ -106,8 +110,6 @@ function(get_test_dependencies SDK result_var_name)
 
   if(NOT SWIFT_BUILT_STANDALONE)
     list(APPEND deps_binaries
-      arcmt-test
-      c-arcmt-test
       c-index-test
       CASPluginTest
       clang
@@ -251,6 +253,7 @@ normalize_boolean_spelling(SWIFT_STDLIB_ENABLE_UNICODE_DATA)
 normalize_boolean_spelling(SWIFT_ENABLE_DISPATCH)
 normalize_boolean_spelling(SWIFT_STDLIB_ENABLE_OBJC_INTEROP)
 normalize_boolean_spelling(SWIFT_ENABLE_BACKTRACING)
+normalize_boolean_spelling(SWIFT_ENABLE_RUNTIME_MODULE)
 normalize_boolean_spelling(SWIFT_BUILD_SWIFT_SYNTAX)
 normalize_boolean_spelling(SWIFT_ENABLE_SYNCHRONIZATION)
 normalize_boolean_spelling(SWIFT_ENABLE_VOLATILE)
@@ -473,6 +476,10 @@ foreach(SDK ${SWIFT_SDKS})
           list(APPEND LIT_ARGS "--param" "volatile")
         endif()
 
+        if(SWIFT_ENABLE_RUNTIME_MODULE)
+          list(APPEND LIT_ARGS "--param" "runtime_module")
+        endif()
+
         if(SWIFT_BUILD_REMOTE_MIRROR)
           list(APPEND LIT_ARGS "--param" "remote_mirror")
         endif()
@@ -581,6 +588,7 @@ if(SWIFT_SHOULD_BUILD_EMBEDDED_STDLIB_CROSS_COMPILING)
       "${CMAKE_CURRENT_SOURCE_DIR}/lit.site.cfg.in"
       "${CMAKE_CURRENT_BINARY_DIR}${VARIANT_SUFFIX}/lit.site.cfg"
       "test${VARIANT_SUFFIX}.lit.site.cfg")
+  swift_generate_lit_swift_features_cfg("${CMAKE_CURRENT_BINARY_DIR}${VARIANT_SUFFIX}/lit.swift-features.cfg")
 
   set(VARIANT_SUFFIX "-embedded-avr")
   set(VARIANT_TRIPLE "avr-none-none-elf")
@@ -591,6 +599,7 @@ if(SWIFT_SHOULD_BUILD_EMBEDDED_STDLIB_CROSS_COMPILING)
       "${CMAKE_CURRENT_SOURCE_DIR}/lit.site.cfg.in"
       "${CMAKE_CURRENT_BINARY_DIR}${VARIANT_SUFFIX}/lit.site.cfg"
       "test${VARIANT_SUFFIX}.lit.site.cfg")
+  swift_generate_lit_swift_features_cfg("${CMAKE_CURRENT_BINARY_DIR}${VARIANT_SUFFIX}/lit.swift-features.cfg")
 
   set(VARIANT_SUFFIX "-embedded-riscv32")
   set(VARIANT_TRIPLE "riscv32-none-none-eabi")
@@ -601,6 +610,7 @@ if(SWIFT_SHOULD_BUILD_EMBEDDED_STDLIB_CROSS_COMPILING)
       "${CMAKE_CURRENT_SOURCE_DIR}/lit.site.cfg.in"
       "${CMAKE_CURRENT_BINARY_DIR}${VARIANT_SUFFIX}/lit.site.cfg"
       "test${VARIANT_SUFFIX}.lit.site.cfg")
+  swift_generate_lit_swift_features_cfg("${CMAKE_CURRENT_BINARY_DIR}${VARIANT_SUFFIX}/lit.swift-features.cfg")
 endif()
 
 # Add shortcuts for the default variant.

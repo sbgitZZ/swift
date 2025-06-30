@@ -17,8 +17,8 @@
 #include "swift/Frontend/Frontend.h"
 #include "clang/AST/DeclObjC.h"
 #include "clang/Basic/TargetInfo.h"
-#include "clang/CodeGen/ObjectFilePCHContainerOperations.h"
 #include "clang/Frontend/CompilerInstance.h"
+#include "clang/Frontend/PCHContainerOperations.h"
 #include "clang/Frontend/TextDiagnosticBuffer.h"
 #include "clang/Lex/PreprocessorOptions.h"
 #include "clang/Serialization/ASTReader.h"
@@ -157,18 +157,13 @@ bool ide::initCompilerInvocation(
     StringRef UnresolvedPrimaryFile,
     llvm::IntrusiveRefCntPtr<llvm::vfs::FileSystem> FileSystem,
     const std::string &swiftExecutablePath,
-    const std::string &runtimeResourcePath,
-    const std::string &diagnosticDocumentationPath, time_t sessionTimestamp,
+    const std::string &runtimeResourcePath, time_t sessionTimestamp,
     std::string &Error) {
   SmallVector<const char *, 16> Args;
-  // Make sure to put '-resource-dir' and '-diagnostic-documentation-path' at
-  // the top to allow overriding them with the passed in arguments.
+  // Make sure to put '-resource-dir' at the top to allow overriding them with
+  // the passed in arguments.
   Args.push_back("-resource-dir");
   Args.push_back(runtimeResourcePath.c_str());
-  Args.push_back("-Xfrontend");
-  Args.push_back("-diagnostic-documentation-path");
-  Args.push_back("-Xfrontend");
-  Args.push_back(diagnosticDocumentationPath.c_str());
   Args.append(OrigArgs.begin(), OrigArgs.end());
 
   SmallString<32> ErrStr;

@@ -39,7 +39,7 @@ import SIL
 /// ```
 
 /// The optimization can be done if:
-/// * In caseof a `load`: during the (forward-extended) lifetime of the loaded value the
+/// * In case of a `load`: during the (forward-extended) lifetime of the loaded value the
 ///                       memory location is not changed.
 /// * In case of a `copy_value`: the (guaranteed) lifetime of the source operand extends
 ///                       the lifetime of the copied value.
@@ -123,10 +123,6 @@ private struct Uses {
   // Those are successor blocks of terminators, like `switch_enum`, which do _not_ forward the value.
   // E.g. the none-case of a switch_enum of an Optional.
   private(set) var nonDestroyingLiverangeExits: Stack<Instruction>
-
-  var allLifetimeEndingInstructions: [Instruction] {
-    Array(destroys.lazy.map { $0 }) + Array(nonDestroyingLiverangeExits)
-  }
 
   private(set) var usersInDeadEndBlocks: Stack<Instruction>
 
@@ -323,7 +319,16 @@ private func createEndBorrows(for beginBorrow: Value, atEndOf liverange: Instruc
   //   destroy_value %2
   //   destroy_value %3  // The final destroy. Here we need to create the `end_borrow`(s)
   //
-  for endInst in collectedUses.allLifetimeEndingInstructions {
+
+  var allLifetimeEndingInstructions = InstructionWorklist(context)
+  allLifetimeEndingInstructions.pushIfNotVisited(contentsOf: collectedUses.destroys.lazy.map { $0 })
+  allLifetimeEndingInstructions.pushIfNotVisited(contentsOf: collectedUses.nonDestroyingLiverangeExits)
+
+  defer {
+    allLifetimeEndingInstructions.deinitialize()
+  }
+
+  while let endInst = allLifetimeEndingInstructions.pop() {
     if !liverange.contains(endInst) {
       let builder = Builder(before: endInst, context)
       builder.createEndBorrow(of: beginBorrow)
@@ -355,6 +360,13 @@ private extension Value {
   }
 
   var lookThroughForwardingInstructions: Value {
+    if let bfi = definingInstruction as? BorrowedFromInst,
+       !bfi.borrowedPhi.isReborrow,
+       bfi.enclosingValues.count == 1
+    {
+      // Return the single forwarded enclosingValue
+      return bfi.enclosingValues[0]
+    }
     if let fi = definingInstruction as? ForwardingInstruction,
        let forwardedOp = fi.singleForwardedOperand
     {

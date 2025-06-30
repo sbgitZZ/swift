@@ -39,30 +39,46 @@ class DeadEndBlocks;
 enum class LifetimeCompletion { NoLifetime, AlreadyComplete, WasCompleted };
 
 class OSSALifetimeCompletion {
-  // If domInfo is nullptr, then InteriorLiveness never assumes dominance. As a
-  // result it may report extra unenclosedPhis. In that case, any attempt to
-  // create a new phi would result in an immediately redundant phi.
+public:
+  enum HandleTrivialVariable_t { IgnoreTrivialVariable, ExtendTrivialVariable };
+
+private:
+  /// If domInfo is nullptr, then InteriorLiveness never assumes dominance. As a
+  /// result it may report extra unenclosedPhis. In that case, any attempt to
+  /// create a new phi would result in an immediately redundant phi.
   const DominanceInfo *domInfo = nullptr;
 
   DeadEndBlocks &deadEndBlocks;
 
-  // Cache intructions already handled by the recursive algorithm to avoid
-  // recomputing their lifetimes.
+  /// Cache intructions already handled by the recursive algorithm to avoid
+  /// recomputing their lifetimes.
   ValueSet completedValues;
 
-public:
-  OSSALifetimeCompletion(SILFunction *function, const DominanceInfo *domInfo,
-                         DeadEndBlocks &deadEndBlocks)
-      : domInfo(domInfo), deadEndBlocks(deadEndBlocks),
-        completedValues(function) {}
+  /// Extend trivial variables for lifetime diagnostics (only in SILGenCleanup).
+  HandleTrivialVariable_t handleTrivialVariable;
 
-  // The kind of boundary at which to complete the lifetime.
-  //
-  // Liveness: "As early as possible."  Consume the value after the last
-  //           non-consuming uses.
-  // Availability: "As late as possible."  Consume the value in the last blocks
-  //               beyond the non-consuming uses in which the value has been
-  //               consumed on no incoming paths.
+  /// Whether verification of the computed liveness should be run even when the
+  /// global setting is off.
+  /// TODO: Remove this option.
+  bool ForceLivenessVerification;
+
+public:
+  OSSALifetimeCompletion(
+      SILFunction *function, const DominanceInfo *domInfo,
+      DeadEndBlocks &deadEndBlocks,
+      HandleTrivialVariable_t handleTrivialVariable = IgnoreTrivialVariable,
+      bool forceLivenessVerification = false)
+      : domInfo(domInfo), deadEndBlocks(deadEndBlocks),
+        completedValues(function), handleTrivialVariable(handleTrivialVariable),
+        ForceLivenessVerification(forceLivenessVerification) {}
+
+  /// The kind of boundary at which to complete the lifetime.
+  ///
+  /// Liveness: "As early as possible."  Consume the value after the last
+  ///           non-consuming uses.
+  /// Availability: "As late as possible."  Consume the value in the last blocks
+  ///               beyond the non-consuming uses in which the value has been
+  ///               consumed on no incoming paths.
   struct Boundary {
     enum Value : uint8_t {
       Liveness,
@@ -93,10 +109,15 @@ public:
   LifetimeCompletion completeOSSALifetime(SILValue value, Boundary boundary) {
     switch (value->getOwnershipKind()) {
     case OwnershipKind::None: {
-      auto scopedAddress = ScopedAddressValue(value);
-      if (!scopedAddress)
-        return LifetimeCompletion::NoLifetime;
-      break;
+      if (auto scopedAddress = ScopedAddressValue(value)) {
+        break;
+      }
+      // During SILGenCleanup, extend move_value [var_decl].
+      if (handleTrivialVariable == ExtendTrivialVariable
+          && value->isFromVarDecl()) {
+        break;
+      }
+      return LifetimeCompletion::NoLifetime;
     }
     case OwnershipKind::Owned:
       break;

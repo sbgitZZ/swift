@@ -22,8 +22,10 @@
 #include "swift/AST/ProtocolConformance.h"
 #include "swift/AST/SubstitutionMap.h"
 #include "swift/Basic/Assertions.h"
+#include "swift/Basic/Mangler.h"
 #include "swift/Basic/Platform.h"
 #include "swift/IRGen/Linking.h"
+#include "swift/Parse/Lexer.h"
 #include "swift/RemoteInspection/MetadataSourceBuilder.h"
 #include "swift/RemoteInspection/Records.h"
 #include "swift/SIL/SILModule.h"
@@ -182,9 +184,10 @@ getRuntimeVersionThatSupportsDemanglingType(CanType type) {
     Swift_5_2,
     Swift_5_5,
     Swift_6_0,
+    Swift_6_1,
 
     // Short-circuit if we find this requirement.
-    Latest = Swift_6_0
+    Latest = Swift_6_1
   };
 
   VersionRequirement latestRequirement = None;
@@ -198,16 +201,29 @@ getRuntimeVersionThatSupportsDemanglingType(CanType type) {
 
   (void) type.findIf([&](CanType t) -> bool {
     if (auto fn = dyn_cast<AnyFunctionType>(t)) {
+      auto isolation = fn->getIsolation();
+      auto sendingResult = fn->hasSendingResult();
+
+      // The Swift 6.1 runtime fixes a bug preventing successful demangling
+      // when @isolated(any) or global actor isolation is combined with a
+      // sending result.
+      if (sendingResult &&
+          (isolation.isErased() || isolation.isGlobalActor()))
+        return addRequirement(Swift_6_1);
+
       // The Swift 6.0 runtime is the first version able to demangle types
-      // that involve typed throws or @isolated(any), or for that matter
-      // represent them at all at runtime.
-      if (!fn.getThrownError().isNull() || fn->getIsolation().isErased())
+      // that involve typed throws, @isolated(any), or a sending result, or
+      // for that matter to represent them at all at runtime.
+      if (!fn.getThrownError().isNull() ||
+          isolation.isErased() ||
+          sendingResult)
         return addRequirement(Swift_6_0);
 
       // The Swift 5.5 runtime is the first version able to demangle types
       // related to concurrency.
-      if (fn->isAsync() || fn->isSendable() ||
-          !fn->getIsolation().isNonIsolated())
+      if (fn->isAsync() ||
+          fn->isSendable() ||
+          !isolation.isNonIsolated())
         return addRequirement(Swift_5_5);
 
       return false;
@@ -255,6 +271,7 @@ getRuntimeVersionThatSupportsDemanglingType(CanType type) {
   });
 
   switch (latestRequirement) {
+  case Swift_6_1: return llvm::VersionTuple(6, 1);
   case Swift_6_0: return llvm::VersionTuple(6, 0);
   case Swift_5_5: return llvm::VersionTuple(5, 5);
   case Swift_5_2: return llvm::VersionTuple(5, 2);
@@ -585,7 +602,7 @@ IRGenModule::emitWitnessTableRefString(CanType type,
             type = genericEnv->mapTypeIntoContext(type)->getCanonicalType();
           }
           if (origType->hasTypeParameter()) {
-            conformance = conformance.subst(origType,
+            conformance = conformance.subst(
                 genericEnv->getForwardingSubstitutionMap());
           }
           auto ret = emitWitnessTableRef(IGF, type, conformance);
@@ -929,9 +946,13 @@ private:
     B.addInt16(uint16_t(kind));
     B.addInt16(FieldRecordSize);
 
-    B.addInt32(getNumFields(NTD));
+    // Emit exportable fields, prefixed with a count
+    B.addInt32(countExportableFields(IGM, NTD));
+
+    // Filter to select which fields we'll export FieldDescriptor for.
     forEachField(IGM, NTD, [&](Field field) {
-      addField(field);
+      if (isExportableField(field))
+        addField(field);
     });
   }
 
@@ -1163,6 +1184,11 @@ public:
 };
 
 void IRGenModule::emitBuiltinTypeMetadataRecord(CanType builtinType) {
+  // If this builtin is generic, don't emit anything.
+  if (builtinType->hasTypeParameter()) {
+    return;
+  }
+
   FixedTypeMetadataBuilder builder(*this, builtinType);
   builder.emit();
 }
@@ -1626,7 +1652,13 @@ llvm::Constant *IRGenModule::getAddrOfFieldName(StringRef Name) {
   if (entry.second)
     return entry.second;
 
-  entry = createStringConstant(Name, /*willBeRelativelyAddressed*/ true,
+  llvm::SmallString<256> ReflName;
+  if (Lexer::identifierMustAlwaysBeEscaped(Name)) {
+    Mangle::Mangler::appendRawIdentifierForRuntime(Name.str(), ReflName);
+  } else {
+    ReflName = Name;
+  }
+  entry = createStringConstant(ReflName, /*willBeRelativelyAddressed*/ true,
                                getReflectionStringsSectionName());
   disableAddressSanitizer(*this, entry.first);
   return entry.second;
@@ -1749,7 +1781,7 @@ void IRGenModule::emitFieldDescriptor(const NominalTypeDecl *D) {
   bool needsMPEDescriptor = false;
   bool needsFieldDescriptor = true;
 
-  if (auto *ED = dyn_cast<EnumDecl>(D)) {
+  if (isa<EnumDecl>(D)) {
     auto &strategy = getEnumImplStrategy(*this, T);
 
     // @objc enums never have generic parameters or payloads,

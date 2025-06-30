@@ -34,9 +34,16 @@ public class Argument : Value, Hashable {
 
   public var isLexical: Bool { false }
 
-  public var varDecl: VarDecl? { bridged.getVarDecl().getAs(VarDecl.self) }
+  public var decl: ValueDecl? { bridged.getDecl().getAs(ValueDecl.self) }
 
-  public var sourceLoc: SourceLoc? { varDecl?.nameLoc }
+  public func findVarDecl() -> VarDecl? {
+    if let varDecl = decl as? VarDecl {
+      return varDecl
+    }
+    return findVarDeclFromDebugUsers()
+  }
+
+  public var sourceLoc: SourceLoc? { findVarDecl()?.nameLoc }
 
   public static func ==(lhs: Argument, rhs: Argument) -> Bool {
     lhs === rhs
@@ -56,6 +63,10 @@ final public class FunctionArgument : Argument {
     bridged.FunctionArgument_isLexical()
   }
 
+  public var isClosureCapture: Bool {
+    bridged.FunctionArgument_isClosureCapture()
+  }
+
   public var isSelf: Bool {
     parentFunction.argumentConventions.selfIndex == index
   }
@@ -71,15 +82,6 @@ final public class FunctionArgument : Argument {
   /// kind of dependence.
   public var resultDependence: LifetimeDependenceConvention? {
     parentFunction.argumentConventions[resultDependsOn: index]
-  }
-
-  /// Copies the following flags from `arg`:
-  /// 1. noImplicitCopy
-  /// 2. lifetimeAnnotation
-  /// 3. closureCapture
-  /// 4. parameterPack
-  public func copyFlags(from arg: FunctionArgument) {
-    bridged.copyFlags(arg.bridged)
   }
 }
 
@@ -192,6 +194,22 @@ public struct Phi {
   }
 }
 
+extension Phi {
+  /// Return true of this phi is directly returned with no side effects between the phi and the return.
+  public var isReturnValue: Bool {
+    if let singleUse = value.uses.singleUse, let ret = singleUse.instruction as? ReturnInst,
+       ret.parentBlock == successor {
+      for inst in successor.instructions {
+        if inst.mayHaveSideEffects {
+          return false
+        }
+      }
+      return true
+    }
+    return false
+  }
+}
+
 extension Operand {
   public var forwardingBorrowedFromUser: BorrowedFromInst? {
     if let bfi = instruction as? BorrowedFromInst, index == 0 {
@@ -260,7 +278,7 @@ public struct ArgumentConventions : Collection, CustomStringConvertible {
     if let paramIdx = parameterIndex(for: argumentIndex) {
       return convention.parameters[paramIdx].convention
     }
-    let resultInfo = convention.indirectSILResults[argumentIndex]
+    let resultInfo = convention.indirectSILResult(at: argumentIndex)
     return ArgumentConvention(result: resultInfo.convention)
   }
 
@@ -268,7 +286,7 @@ public struct ArgumentConventions : Collection, CustomStringConvertible {
     if parameterIndex(for: argumentIndex) != nil {
       return nil
     }
-    return convention.indirectSILResults[argumentIndex]
+    return convention.indirectSILResult(at: argumentIndex)
   }
 
   public subscript(parameter argumentIndex: Int) -> ParameterInfo? {

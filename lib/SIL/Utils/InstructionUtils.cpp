@@ -335,7 +335,21 @@ bool swift::isEndOfScopeMarker(SILInstruction *user) {
 
 bool swift::isIncidentalUse(SILInstruction *user) {
   return isEndOfScopeMarker(user) || user->isDebugInstruction() ||
-         isa<FixLifetimeInst>(user) || isa<EndLifetimeInst>(user);
+         isa<FixLifetimeInst>(user) || isa<EndLifetimeInst>(user) ||
+         isa<IgnoredUseInst>(user);
+}
+
+bool swift::isMoveOnlyWrapperUse(SILInstruction *user) {
+  switch (user->getKind()) {
+  case SILInstructionKind::MoveOnlyWrapperToCopyableValueInst:
+  case SILInstructionKind::MoveOnlyWrapperToCopyableBoxInst:
+  case SILInstructionKind::MoveOnlyWrapperToCopyableAddrInst:
+  case SILInstructionKind::CopyableToMoveOnlyWrapperValueInst:
+  case SILInstructionKind::CopyableToMoveOnlyWrapperAddrInst:
+    return true;
+  default:
+    return false;
+  }
 }
 
 bool swift::onlyAffectsRefCount(SILInstruction *user) {
@@ -365,7 +379,7 @@ bool swift::onlyAffectsRefCount(SILInstruction *user) {
 }
 
 bool swift::mayCheckRefCount(SILInstruction *User) {
-  return isa<IsUniqueInst>(User) || isa<IsEscapingClosureInst>(User) ||
+  return isa<IsUniqueInst>(User) || isa<DestroyNotEscapedClosureInst>(User) ||
          isa<BeginCOWMutationInst>(User);
 }
 
@@ -544,6 +558,7 @@ RuntimeEffect swift::getRuntimeEffect(SILInstruction *inst, SILType &impactType)
   case SILInstructionKind::ClassifyBridgeObjectInst:
   case SILInstructionKind::ValueToBridgeObjectInst:
   case SILInstructionKind::MarkDependenceInst:
+  case SILInstructionKind::MarkDependenceAddrInst:
   case SILInstructionKind::MergeIsolationRegionInst:
   case SILInstructionKind::MoveValueInst:
   case SILInstructionKind::DropDeinitInst:
@@ -566,6 +581,7 @@ RuntimeEffect swift::getRuntimeEffect(SILInstruction *inst, SILType &impactType)
   case SILInstructionKind::TupleExtractInst:
   case SILInstructionKind::StructInst:
   case SILInstructionKind::StructExtractInst:
+  case SILInstructionKind::VectorBaseAddrInst:
   case SILInstructionKind::RefElementAddrInst:
   case SILInstructionKind::EnumInst:
   case SILInstructionKind::UncheckedEnumDataInst:
@@ -613,6 +629,7 @@ RuntimeEffect swift::getRuntimeEffect(SILInstruction *inst, SILType &impactType)
   case SILInstructionKind::DifferentiabilityWitnessFunctionInst:
   case SILInstructionKind::IncrementProfilerCounterInst:
   case SILInstructionKind::EndCOWMutationInst:
+  case SILInstructionKind::EndCOWMutationAddrInst:
   case SILInstructionKind::HasSymbolInst:
   case SILInstructionKind::DynamicPackIndexInst:
   case SILInstructionKind::PackPackIndexInst:
@@ -623,6 +640,7 @@ RuntimeEffect swift::getRuntimeEffect(SILInstruction *inst, SILType &impactType)
   case SILInstructionKind::DebugStepInst:
   case SILInstructionKind::FunctionExtractIsolationInst:
   case SILInstructionKind::TypeValueInst:
+  case SILInstructionKind::IgnoredUseInst:
     return RuntimeEffect::NoEffect;
       
   case SILInstructionKind::OpenExistentialMetatypeInst:
@@ -767,7 +785,6 @@ RuntimeEffect swift::getRuntimeEffect(SILInstruction *inst, SILType &impactType)
     return RuntimeEffect::MetaData;
 
   case SILInstructionKind::AllocStackInst:
-  case SILInstructionKind::AllocVectorInst:
   case SILInstructionKind::ProjectBoxInst: {
     SILType allocType = cast<SingleValueInstruction>(inst)->getType();
     if (allocType.hasArchetype() && !allocType.isLoadable(*inst->getFunction())) {
@@ -916,7 +933,7 @@ RuntimeEffect swift::getRuntimeEffect(SILInstruction *inst, SILType &impactType)
   case SILInstructionKind::BeginDeallocRefInst:
   case SILInstructionKind::EndInitLetRefInst:
   case SILInstructionKind::IsUniqueInst:
-  case SILInstructionKind::IsEscapingClosureInst:
+  case SILInstructionKind::DestroyNotEscapedClosureInst:
   case SILInstructionKind::CopyBlockInst:
   case SILInstructionKind::CopyBlockWithoutEscapingInst:
     return ifNonTrivial(inst->getOperand(0)->getType(),
@@ -1005,7 +1022,7 @@ RuntimeEffect swift::getRuntimeEffect(SILInstruction *inst, SILType &impactType)
     case SILFunctionTypeRepresentation::WitnessMethod: {
       auto conformance =
           as.getOrigCalleeType()->getWitnessMethodConformanceOrInvalid();
-      if (conformance.getRequirement()->requiresClass()) {
+      if (conformance.getProtocol()->requiresClass()) {
           rt |= RuntimeEffect::MetaData | RuntimeEffect::ExistentialClassBound;
       } else {
           rt |= RuntimeEffect::MetaData | RuntimeEffect::Existential;

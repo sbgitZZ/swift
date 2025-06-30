@@ -204,14 +204,6 @@ bool TypeVariableType::Implementation::isCollectionLiteralType() const {
                      locator->directlyAt<DictionaryExpr>());
 }
 
-bool TypeVariableType::Implementation::isNumberLiteralType() const {
-  return locator && locator->directlyAt<NumberLiteralExpr>();
-}
-
-bool TypeVariableType::Implementation::isFunctionResult() const {
-  return locator && locator->isLastElement<LocatorPathElt::FunctionResult>();
-}
-
 void *operator new(size_t bytes, ConstraintSystem& cs,
                    size_t alignment) {
   return cs.getAllocator().Allocate(bytes, alignment);
@@ -347,7 +339,16 @@ public:
     // closures.
     if (ExprDepth == 0) {
       auto isExprStmt = (E == Target.getAsExpr()) ? IsTopLevelExprStmt : false;
-      performSyntacticExprDiagnostics(E, Target.getDeclContext(), isExprStmt);
+
+      bool isConstInitExpr = false;
+      if (Target.isForInitialization()) {
+        if (auto initPattern = Target.getInitializationPattern())
+          if (auto namedPatternVarDecl = initPattern->getSingleVar())
+            isConstInitExpr = namedPatternVarDecl->isConstValue();
+      }
+
+      performSyntacticExprDiagnostics(E, Target.getDeclContext(), isExprStmt,
+                                      isConstInitExpr);
     }
     ExprDepth += 1;
     return Action::Continue(E);
@@ -427,10 +428,12 @@ TypeChecker::typeCheckTarget(SyntacticElementTarget &target,
   PrettyStackTraceLocation stackTrace(Context, "type-checking-target",
                                       target.getLoc());
 
-  // First, pre-check the target, validating any types that occur in the
-  // expression and folding sequence expressions.
-  if (ConstraintSystem::preCheckTarget(target))
-    return errorResult();
+  if (!options.contains(TypeCheckExprFlags::AvoidInvalidatingAST)) {
+    // First, pre-check the target, validating any types that occur in the
+    // expression and folding sequence expressions.
+    if (ConstraintSystem::preCheckTarget(target))
+      return errorResult();
+  }
 
   // Check whether given target has a code completion token which requires
   // special handling. Returns true if handled, in which case we've already
@@ -458,6 +461,10 @@ TypeChecker::typeCheckTarget(SyntacticElementTarget &target,
     // diagnostics and is a hint for various performance optimizations.
     cs.setContextualInfo(expr, target.getExprContextualTypeInfo());
 
+    // Try to shrink the system by reducing disjunction domains. This
+    // goes through every sub-expression and generate its own sub-system, to
+    // try to reduce the domains of those subexpressions.
+    cs.shrink(expr);
     target.setExpr(expr);
   }
 
@@ -513,6 +520,11 @@ Type TypeChecker::typeCheckParameterDefault(Expr *&defaultValue,
 
   auto paramInterfaceTy = paramType->mapTypeOutOfContext();
 
+  // Attempt to pre-check expression first, if that fails - skip type-checking.
+  // This would make sure that diagnostics about invalid AST are never dropped.
+  if (ConstraintSystem::preCheckTarget(defaultExprTarget))
+    return Type();
+
   {
     // Buffer all of the diagnostics produced by \c typeCheckExpression
     // since in some cases we need to try type-checking again with a
@@ -535,8 +547,8 @@ Type TypeChecker::typeCheckParameterDefault(Expr *&defaultValue,
     // First, let's try to type-check default expression using
     // archetypes, which guarantees that it would work for any
     // substitution of the generic parameter (if they are involved).
-    if (auto result = typeCheckExpression(
-            defaultExprTarget, options, &diagnostics)) {
+    if (auto result =
+            typeCheckTarget(defaultExprTarget, options, &diagnostics)) {
       defaultValue = result->getAsExpr();
       return defaultValue->getType();
     }
@@ -627,17 +639,26 @@ Type TypeChecker::typeCheckParameterDefault(Expr *&defaultValue,
   // Check whether generic parameters are only mentioned once in
   // the anchor's signature.
   {
-    auto anchorTy = anchor->getInterfaceType()->castTo<GenericFunctionType>();
+    auto anchorTy = anchor->getInterfaceType()->castTo<AnyFunctionType>();
 
-    // Reject if generic parameters are used in multiple different positions
-    // in the parameter list.
+    if (anchor->hasCurriedSelf())
+      anchorTy = anchorTy->getResult()->castTo<AnyFunctionType>();
+
+    SmallPtrSet<CanType, 4> inferrableParams;
+    collectReferencedGenericParams(paramInterfaceTy, inferrableParams);
 
     llvm::SmallVector<unsigned, 2> affectedParams;
     for (unsigned i : indices(anchorTy->getParams())) {
-      const auto &param = anchorTy->getParams()[i];
 
-      if (containsTypes(param.getPlainType()))
-        affectedParams.push_back(i);
+      SmallPtrSet<CanType, 4> referencedGenericParams;
+      collectReferencedGenericParams(anchorTy->getParams()[i].getPlainType(), referencedGenericParams);
+
+      for (auto can : referencedGenericParams) {
+        if (can->is<GenericTypeParamType>() && inferrableParams.contains(can)) {
+          affectedParams.push_back(i);
+          break;
+        }
+      }
     }
 
     if (affectedParams.size() > 1) {
@@ -648,12 +669,19 @@ Type TypeChecker::typeCheckParameterDefault(Expr *&defaultValue,
           affectedParams, [&](const unsigned index) { params << "#" << index; },
           [&] { params << ", "; });
 
-      ctx.Diags.diagnose(
+      auto diag = ctx.Diags.diagnose(
           defaultValue->getLoc(),
           diag::
               cannot_default_generic_parameter_inferrable_from_another_parameter,
           paramInterfaceTy, params.str());
-      return Type();
+
+      // In Swift 6.2 and below we incorrectly missed checking this rule for
+      // methods, downgrade to a warning until the next language mode.
+      auto futureVersion = version::Version::getFutureMajorLanguageVersion();
+      if (!anchor->hasCurriedSelf() || ctx.isSwiftVersionAtLeast(futureVersion))
+        return Type();
+
+      diag.warnUntilFutureSwiftVersion();
     }
   }
 
@@ -670,7 +698,7 @@ Type TypeChecker::typeCheckParameterDefault(Expr *&defaultValue,
   {
     auto recordRequirement = [&](unsigned index, Requirement requirement,
                                  ConstraintLocator *locator) {
-      cs.openGenericRequirement(DC->getParent(), index, requirement,
+      cs.openGenericRequirement(DC->getParent(), signature, index, requirement,
                                 /*skipSelfProtocolConstraint=*/false, locator,
                                 [&](Type type) -> Type {
                                   return cs.openType(type, genericParameters,
@@ -790,9 +818,11 @@ bool TypeChecker::typeCheckBinding(Pattern *&pattern, Expr *&initializer,
                                    TypeCheckExprOptions options) {
   SyntacticElementTarget target =
       PBD ? SyntacticElementTarget::forInitialization(
-                initializer, patternType, PBD, patternNumber)
+                initializer, patternType, PBD, patternNumber,
+                /*bindPatternVarsOneWay=*/false)
           : SyntacticElementTarget::forInitialization(
-                initializer, DC, patternType, pattern);
+                initializer, DC, patternType, pattern,
+                /*bindPatternVarsOneWay=*/false);
 
   // Type-check the initializer.
   auto resultTarget = typeCheckExpression(target, options);
@@ -873,8 +903,7 @@ bool TypeChecker::typeCheckPatternBinding(PatternBindingDecl *PBD,
   return hadError;
 }
 
-bool TypeChecker::typeCheckForEachPreamble(DeclContext *dc, ForEachStmt *stmt,
-                                           GenericEnvironment *packElementEnv) {
+bool TypeChecker::typeCheckForEachPreamble(DeclContext *dc, ForEachStmt *stmt) {
   auto &Context = dc->getASTContext();
   FrontendStatsTracer statsTracer(Context.Stats, "typecheck-for-each", stmt);
   PrettyStackTraceStmt stackTrace(Context, "type-checking-for-each", stmt);
@@ -890,8 +919,7 @@ bool TypeChecker::typeCheckForEachPreamble(DeclContext *dc, ForEachStmt *stmt,
     return true;
   };
 
-  auto target =
-      SyntacticElementTarget::forForEachPreamble(stmt, dc, packElementEnv);
+  auto target = SyntacticElementTarget::forForEachPreamble(stmt, dc);
   if (!typeCheckTarget(target))
     return failed();
 
@@ -900,8 +928,7 @@ bool TypeChecker::typeCheckForEachPreamble(DeclContext *dc, ForEachStmt *stmt,
     if (!boolType)
       return failed();
 
-    SyntacticElementTarget whereClause(stmt->getWhere(), dc,
-                                       {boolType, CTP_Condition},
+    SyntacticElementTarget whereClause(where, dc, {boolType, CTP_Condition},
                                        /*isDiscarded=*/false);
     auto result = typeCheckTarget(whereClause);
     if (!result)
@@ -988,8 +1015,22 @@ static Type openTypeParameter(ConstraintSystem &cs,
     cs.addConstraint(ConstraintKind::Subtype, replacement,
                      superclass, locator);
   }
+
+  // If we have a Sendable or SendableMetatype conformance requirement,
+  // we have to prohibit nonisolated conformances.
+  bool prohibitNonisolated = false;
   for (auto proto : archetypeTy->getConformsTo()) {
-    cs.addConstraint(ConstraintKind::ConformsTo, replacement,
+    if (proto->isSpecificProtocol(KnownProtocolKind::Sendable) ||
+        proto->isSpecificProtocol(KnownProtocolKind::SendableMetatype)) {
+      prohibitNonisolated = true;
+      break;
+    }
+  }
+
+  for (auto proto : archetypeTy->getConformsTo()) {
+    auto kind = prohibitNonisolated ? ConstraintKind::NonisolatedConformsTo
+                                    : ConstraintKind::ConformsTo;
+    cs.addConstraint(kind, replacement,
                      proto->getDeclaredInterfaceType(), locator);
   }
 
@@ -1039,8 +1080,14 @@ bool TypeChecker::typesSatisfyConstraint(Type type1, Type type2,
                                          bool openArchetypes,
                                          ConstraintKind kind, DeclContext *dc,
                                          bool *unwrappedIUO) {
-  assert(!type1->hasTypeVariable() && !type2->hasTypeVariable() &&
-         "Unexpected type variable in constraint satisfaction testing");
+  // Don't allow any type variables to leak into the nested ConstraintSystem
+  // (including as originator types for placeholders). This also ensure that we
+  // avoid lifetime issues for e.g cases where we lazily populate the
+  // `ContextSubMap` on `NominalOrBoundGenericNominalType` in the nested arena,
+  // since it will be destroyed on leaving.
+  ASSERT(!type1->getRecursiveProperties().isSolverAllocated() &&
+         !type2->getRecursiveProperties().isSolverAllocated() &&
+         "Cannot escape solver-allocated types into a nested ConstraintSystem");
 
   ConstraintSystem cs(dc, ConstraintSystemOptions());
   if (openArchetypes) {
@@ -1635,11 +1682,11 @@ void ConstraintSystem::print(raw_ostream &out) const {
 
   if (!PackExpansionEnvironments.empty()) {
     out.indent(indent) << "Pack Expansion Environments:\n";
-    for (const auto &env : PackExpansionEnvironments) {
+    for (const auto &[packExpansion, env] : PackExpansionEnvironments) {
       out.indent(indent + 2);
-      env.first->dump(&getASTContext().SourceMgr, out);
-      out << " = (" << env.second.first << ", "
-          << env.second.second->getString(PO) << ")" << '\n';
+      dumpAnchor(packExpansion, &getASTContext().SourceMgr, out);
+      out << " = (" << env->getOpenedElementShapeClass() << ", "
+      << env->getOpenedElementUUID() << ")" << '\n';
     }
   }
 
@@ -1844,8 +1891,8 @@ TypeChecker::typeCheckCheckedCast(Type fromType, Type toType,
   };
 
   // Check for casts between specific concrete types that cannot succeed.
-  if (auto toElementType = toType->isArrayType()) {
-    if (auto fromElementType = fromType->isArrayType()) {
+  if (auto toElementType = toType->getArrayElementType()) {
+    if (auto fromElementType = fromType->getArrayElementType()) {
       return checkElementCast(fromElementType, toElementType,
                               CheckedCastKind::ArrayDowncast);
     }

@@ -18,6 +18,7 @@
 #define SWIFT_REMOTE_METADATAREADER_H
 
 
+#include "swift/ABI/Metadata.h"
 #include "swift/Runtime/Metadata.h"
 #include "swift/Remote/MemoryReader.h"
 #include "swift/Demangling/Demangler.h"
@@ -415,11 +416,9 @@ public:
   }
 
   RemoteAbsolutePointer stripSignedPointer(const RemoteAbsolutePointer &P) {
-    if (P.isResolved()) {
-      return RemoteAbsolutePointer("", 
-        P.getResolvedAddress().getAddressData() & PtrAuthMask);
-    }
-    return P;
+    return RemoteAbsolutePointer(
+        P.getSymbol(), P.getOffset(),
+        RemoteAddress(P.getResolvedAddress().getAddressData() & PtrAuthMask));
   }
 
   StoredPointer queryPtrAuthMask() {
@@ -518,28 +517,12 @@ public:
         // The second entry is a relative address to the mangled protocol
         // without symbolic references.
 
-        // lldb might return an unresolved remote absolute pointer from its
-        // resolvePointerAsSymbol implementation -- workaround this.
-        if (!resolved.isResolved()) {
-          auto remoteAddr = RemoteAddress(remoteAddress);
-          resolved =
-            RemoteAbsolutePointer("", remoteAddr.getAddressData());
-        }
-
         auto addr =
             resolved.getResolvedAddress().getAddressData() + sizeof(int32_t);
         int32_t offset;
         Reader->readInteger(RemoteAddress(addr), &offset);
         auto addrOfTypeRef = addr + offset;
         resolved = Reader->getSymbol(RemoteAddress(addrOfTypeRef));
-
-        // lldb might return an unresolved remote absolute pointer from its
-        // resolvePointerAsSymbol implementation -- workaround this.
-        if (!resolved.isResolved()) {
-          auto remoteAddr = RemoteAddress(addrOfTypeRef);
-          resolved =
-            RemoteAbsolutePointer("", remoteAddr.getAddressData());
-        }
 
         // Dig out the protocol from the protocol list.
         auto protocolList = readMangledName(resolved.getResolvedAddress(),
@@ -1378,12 +1361,10 @@ public:
   ParentContextDescriptorRef
   readContextDescriptor(const RemoteAbsolutePointer &address) {
     // Map an unresolved pointer to an unresolved context ref.
-    if (!address.isResolved()) {
+    if (!address.getSymbol().empty()) {
       // We can only handle references to a symbol without an offset currently.
-      if (address.getOffset() != 0) {
-        return ParentContextDescriptorRef();
-      }
-      return ParentContextDescriptorRef(address.getSymbol());
+      if (address.getOffset() == 0)
+        return ParentContextDescriptorRef(address.getSymbol());
     }
     
     return ParentContextDescriptorRef(
@@ -1451,135 +1432,107 @@ public:
     if (address == 0)
       return nullptr;
 
+    auto remoteAddress = RemoteAddress(address);
+    auto ptr = Reader->readBytes(remoteAddress,
+                                 sizeof(TargetContextDescriptor<Runtime>));
+    if (!ptr)
+      return nullptr;
+
     auto cached = ContextDescriptorCache.find(address);
     if (cached != ContextDescriptorCache.end())
       return ContextDescriptorRef(
           address, reinterpret_cast<const TargetContextDescriptor<Runtime> *>(
                        cached->second.get()));
 
-    // Read the flags to figure out how much space we should read.
-    ContextDescriptorFlags flags;
-    if (!Reader->readBytes(RemoteAddress(address), (uint8_t*)&flags,
-                           sizeof(flags)))
-      return nullptr;
-    
-    TypeContextDescriptorFlags typeFlags(flags.getKindSpecificFlags());
-    uint64_t baseSize = 0;
-    uint64_t genericHeaderSize = sizeof(GenericContextDescriptorHeader);
-    uint64_t metadataInitSize = 0;
-    bool hasVTable = false;
-
-    auto readMetadataInitSize = [&]() -> unsigned {
-      switch (typeFlags.getMetadataInitialization()) {
-      case TypeContextDescriptorFlags::NoMetadataInitialization:
-        return 0;
-      case TypeContextDescriptorFlags::SingletonMetadataInitialization:
-        // FIXME: classes
-        return sizeof(TargetSingletonMetadataInitialization<Runtime>);
-      case TypeContextDescriptorFlags::ForeignMetadataInitialization:
-        return sizeof(TargetForeignMetadataInitialization<Runtime>);
-      }
-      return 0;
-    };
-
-    switch (flags.getKind()) {
+    bool success = false;
+    switch (
+        reinterpret_cast<const TargetContextDescriptor<Runtime> *>(ptr.get())
+            ->getKind()) {
     case ContextDescriptorKind::Module:
-      baseSize = sizeof(TargetModuleContextDescriptor<Runtime>);
+      ptr = Reader->readBytes(remoteAddress,
+                              sizeof(TargetModuleContextDescriptor<Runtime>));
+      success = ptr != nullptr;
       break;
-    // TODO: Should we include trailing generic arguments in this load?
     case ContextDescriptorKind::Extension:
-      baseSize = sizeof(TargetExtensionContextDescriptor<Runtime>);
+      success =
+          readFullContextDescriptor<TargetExtensionContextDescriptor<Runtime>>(
+              remoteAddress, ptr);
       break;
     case ContextDescriptorKind::Anonymous:
-      baseSize = sizeof(TargetAnonymousContextDescriptor<Runtime>);
-      if (AnonymousContextDescriptorFlags(flags.getKindSpecificFlags())
-            .hasMangledName()) {
-        metadataInitSize = sizeof(TargetMangledContextName<Runtime>);
-      }
+      success =
+          readFullContextDescriptor<TargetAnonymousContextDescriptor<Runtime>>(
+              remoteAddress, ptr);
       break;
     case ContextDescriptorKind::Class:
-      baseSize = sizeof(TargetClassDescriptor<Runtime>);
-      genericHeaderSize = sizeof(TypeGenericContextDescriptorHeader);
-      hasVTable = typeFlags.class_hasVTable();
-      metadataInitSize = readMetadataInitSize();
+      success = readFullContextDescriptor<TargetClassDescriptor<Runtime>>(
+          remoteAddress, ptr);
       break;
     case ContextDescriptorKind::Enum:
-      baseSize = sizeof(TargetEnumDescriptor<Runtime>);
-      genericHeaderSize = sizeof(TypeGenericContextDescriptorHeader);
-      metadataInitSize = readMetadataInitSize();
+      success = readFullContextDescriptor<TargetEnumDescriptor<Runtime>>(
+          remoteAddress, ptr);
       break;
     case ContextDescriptorKind::Struct:
-      baseSize = sizeof(TargetStructDescriptor<Runtime>);
-      genericHeaderSize = sizeof(TypeGenericContextDescriptorHeader);
-      metadataInitSize = readMetadataInitSize();
+      success = readFullContextDescriptor<TargetStructDescriptor<Runtime>>(
+          remoteAddress, ptr);
       break;
     case ContextDescriptorKind::Protocol:
-      baseSize = sizeof(TargetProtocolDescriptor<Runtime>);
+      success = readFullContextDescriptor<TargetProtocolDescriptor<Runtime>>(
+          remoteAddress, ptr);
       break;
     case ContextDescriptorKind::OpaqueType:
-      baseSize = sizeof(TargetOpaqueTypeDescriptor<Runtime>);
-      metadataInitSize =
-        sizeof(typename Runtime::template RelativeDirectPointer<const char>)
-          * flags.getKindSpecificFlags();
+      success = readFullContextDescriptor<TargetOpaqueTypeDescriptor<Runtime>>(
+          remoteAddress, ptr);
       break;
     default:
       // We don't know about this kind of context.
       return nullptr;
     }
-
-    // Determine the full size of the descriptor. This is reimplementing a fair
-    // bit of TrailingObjects but for out-of-process; maybe there's a way to
-    // factor the layout stuff out...
-    uint64_t genericsSize = 0;
-    if (flags.isGeneric()) {
-      GenericContextDescriptorHeader header;
-      auto headerAddr = address
-        + baseSize
-        + genericHeaderSize
-        - sizeof(header);
-      
-      if (!Reader->readBytes(RemoteAddress(headerAddr),
-                             (uint8_t*)&header, sizeof(header)))
-        return nullptr;
-      
-      genericsSize = genericHeaderSize
-        + (header.NumParams + 3u & ~3u)
-        + header.NumRequirements
-          * sizeof(TargetGenericRequirementDescriptor<Runtime>);
-    }
-
-    uint64_t vtableSize = 0;
-    if (hasVTable) {
-      TargetVTableDescriptorHeader<Runtime> header;
-      auto headerAddr = address
-        + baseSize
-        + genericsSize
-        + metadataInitSize;
-      
-      if (!Reader->readBytes(RemoteAddress(headerAddr),
-                             (uint8_t*)&header, sizeof(header)))
-        return nullptr;
-
-      vtableSize = sizeof(header)
-        + header.VTableSize * sizeof(TargetMethodDescriptor<Runtime>);
-    }
-
-    uint64_t size = baseSize + genericsSize + metadataInitSize + vtableSize;
-    if (size > MaxMetadataSize)
-      return nullptr;
-    auto readResult = Reader->readBytes(RemoteAddress(address), size);
-    if (!readResult)
+    if (!success)
       return nullptr;
 
-    auto descriptor =
-        reinterpret_cast<const TargetContextDescriptor<Runtime> *>(
-            readResult.get());
-
-    ContextDescriptorCache.insert(
-        std::make_pair(address, std::move(readResult)));
+    auto *descriptor =
+        reinterpret_cast<const TargetContextDescriptor<Runtime> *>(ptr.get());
+    ContextDescriptorCache.insert(std::make_pair(address, std::move(ptr)));
     return ContextDescriptorRef(address, descriptor);
   }
-  
+
+  template <typename DescriptorTy>
+  bool readFullContextDescriptor(RemoteAddress address,
+                                 MemoryReader::ReadBytesResult &ptr) {
+    // Read the full base descriptor if it's bigger than what we have so far.
+    if (sizeof(DescriptorTy) > sizeof(TargetContextDescriptor<Runtime>)) {
+      ptr = Reader->template readObj<DescriptorTy>(address);
+      if (!ptr)
+        return false;
+    }
+
+    // We don't know how much memory we need to read to get all the trailing
+    // objects, but we need to read the memory to figure out how much memory we
+    // need to read. Handle this by reading incrementally.
+    //
+    // We rely on the fact that each trailing object's count depends only on
+    // that comes before it. If we've read the first N trailing objects, then we
+    // can safely compute the size with N+1 trailing objects. If that size is
+    // bigger than what we've read so far, re-read the descriptor with the new
+    // size. Once we've walked through all the trailing objects, we've read
+    // everything.
+
+    size_t sizeSoFar = sizeof(DescriptorTy);
+
+    for (size_t i = 0; i < DescriptorTy::trailingTypeCount(); i++) {
+      const DescriptorTy *descriptorSoFar =
+          reinterpret_cast<const DescriptorTy *>(ptr.get());
+      size_t thisSize = descriptorSoFar->sizeWithTrailingTypeCount(i);
+      if (thisSize > sizeSoFar) {
+        ptr = Reader->readBytes(address, thisSize);
+        if (!ptr)
+          return false;
+        sizeSoFar = thisSize;
+      }
+    }
+    return true;
+  }
+
   /// Demangle the entity represented by a symbolic reference to a given symbol name.
   Demangle::NodePointer
   buildContextManglingForSymbol(StringRef symbol, Demangler &dem) {
@@ -2043,7 +1996,7 @@ public:
 
   std::optional<StoredPointer> readResolvedPointerValue(StoredPointer address) {
     if (auto pointer = readPointer(address)) {
-      if (!pointer->isResolved())
+      if (!pointer->getResolvedAddress())
         return std::nullopt;
       return (StoredPointer)pointer->getResolvedAddress().getAddressData();
     }
@@ -2106,7 +2059,7 @@ protected:
       return std::nullopt;
     }
     
-    return RemoteAbsolutePointer("", resultAddress);
+    return RemoteAbsolutePointer(RemoteAddress(resultAddress));
   }
 
   /// Given a pointer to an Objective-C class, try to read its class name.
@@ -2362,13 +2315,11 @@ private:
     auto parentAddress = resolveRelativeIndirectableField(base, base->Parent);
     if (!parentAddress)
       return std::nullopt;
-    if (!parentAddress->isResolved()) {
+    if (!parentAddress->getSymbol().empty()) {
       // Currently we can only handle references directly to a symbol without
       // an offset.
-      if (parentAddress->getOffset() != 0) {
-        return std::nullopt;
-      }
-      return ParentContextDescriptorRef(parentAddress->getSymbol());
+      if (parentAddress->getOffset() == 0)
+        return ParentContextDescriptorRef(parentAddress->getSymbol());
     }
     auto addr = parentAddress->getResolvedAddress();
     if (!addr)
@@ -2934,8 +2885,10 @@ private:
     case ContextDescriptorKind::Anonymous: {
       // Use the remote address to identify the anonymous context.
       char addressBuf[18];
+      RemoteAddress address(descriptor.getAddressData());
+      address = Reader->resolveRemoteAddress(address).value_or(address);
       snprintf(addressBuf, sizeof(addressBuf), "$%" PRIx64,
-               (uint64_t)descriptor.getAddressData());
+               (uint64_t)address.getAddressData());
       auto anonNode = dem.createNode(Node::Kind::AnonymousContext);
       CharVector addressStr;
       addressStr.append(addressBuf, dem);

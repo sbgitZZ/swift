@@ -266,6 +266,7 @@ public:
   void visitDestructorDecl(DestructorDecl *d) {}
   void visitModuleDecl(ModuleDecl *d) { }
   void visitMissingMemberDecl(MissingMemberDecl *d) {}
+  void visitUsingDecl(UsingDecl *) {}
 
   // Emitted as part of its storage.
   void visitAccessorDecl(AccessorDecl *ad) {}
@@ -273,7 +274,6 @@ public:
   void visitFuncDecl(FuncDecl *fd);
   void visitPatternBindingDecl(PatternBindingDecl *vd);
   void visitTopLevelCodeDecl(TopLevelCodeDecl *td) {}
-  void visitPoundDiagnosticDecl(PoundDiagnosticDecl *PDD);
   void visitNominalTypeDecl(NominalTypeDecl *ntd);
   void visitExtensionDecl(ExtensionDecl *ed);
   void visitVarDecl(VarDecl *vd);
@@ -390,6 +390,10 @@ public:
   /// Emit the default witness table for a resilient protocol.
   void emitDefaultWitnessTable(ProtocolDecl *protocol);
 
+  void emitDefaultOverrideTable(ClassDecl *decl);
+
+  SILFunction *emitDefaultOverride(SILDeclRef replacement, SILDeclRef original);
+
   /// Emit the self-conformance witness table for a protocol.
   void emitSelfConformanceWitnessTable(ProtocolDecl *protocol);
 
@@ -421,24 +425,17 @@ public:
   /// Is the self method of the given nonmutating method passed indirectly?
   bool isNonMutatingSelfIndirect(SILDeclRef method);
 
-  SILDeclRef getAccessorDeclRef(AccessorDecl *accessor,
-                                ResilienceExpansion expansion);
+  SILDeclRef getFuncDeclRef(FuncDecl *funcDecl, ResilienceExpansion expansion);
 
   bool canStorageUseStoredKeyPathComponent(AbstractStorageDecl *decl,
                                            ResilienceExpansion expansion);
 
-  KeyPathPatternComponent
-  emitKeyPathComponentForDecl(SILLocation loc,
-                              GenericEnvironment *genericEnv,
-                              ResilienceExpansion expansion,
-                              unsigned &baseOperand,
-                              bool &needsGenericContext,
-                              SubstitutionMap subs,
-                              AbstractStorageDecl *storage,
-                              ArrayRef<ProtocolConformanceRef> indexHashables,
-                              CanType baseTy,
-                              DeclContext *useDC,
-                              bool forPropertyDescriptor);
+  KeyPathPatternComponent emitKeyPathComponentForDecl(
+      SILLocation loc, GenericEnvironment *genericEnv,
+      ResilienceExpansion expansion, unsigned &baseOperand,
+      bool &needsGenericContext, SubstitutionMap subs, ValueDecl *decl,
+      ArrayRef<ProtocolConformanceRef> indexHashables, CanType baseTy,
+      DeclContext *useDC, bool forPropertyDescriptor, bool isApplied = false);
 
   /// Emit all differentiability witnesses for the given function, visiting its
   /// `@differentiable` and `@derivative` attributes.
@@ -562,6 +559,15 @@ public:
   FuncDecl *getDeinitOnExecutor();
   // Retrieve the _SwiftConcurrencyShims.exit intrinsic.
   FuncDecl *getExit();
+
+  /// Get the configured ExecutorFactory type.
+  Type getConfiguredExecutorFactory();
+
+  /// Get the DefaultExecutorFactory type.
+  Type getDefaultExecutorFactory();
+
+  /// Get the swift_createExecutors function.
+  FuncDecl *getCreateExecutors();
 
   SILFunction *getKeyPathProjectionCoroutine(bool isReadAccess,
                                              KeyPathTypeKind typeKind);

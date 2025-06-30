@@ -55,6 +55,8 @@ void swift::simple_display(llvm::raw_ostream &out, DeclName name) {
 }
 
 raw_ostream &llvm::operator<<(raw_ostream &OS, DeclNameRef I) {
+  if (I.hasModuleSelector())
+    OS << I.getModuleSelector() << "::";
   OS << I.getFullName();
   return OS;
 }
@@ -78,16 +80,10 @@ raw_ostream &llvm::operator<<(raw_ostream &OS, swift::ObjCSelector S) {
   return OS;
 }
 
-bool Identifier::isOperatorSlow() const {
-  StringRef data = str();
-  auto *s = reinterpret_cast<llvm::UTF8 const *>(data.begin()),
-  *end = reinterpret_cast<llvm::UTF8 const *>(data.end());
-  llvm::UTF32 codePoint;
-  llvm::ConversionResult res =
-    llvm::convertUTF8Sequence(&s, end, &codePoint, llvm::strictConversion);
-  assert(res == llvm::conversionOK && "invalid UTF-8 in identifier?!");
-  (void)res;
-  return !empty() && isOperatorStartCodePoint(codePoint);
+bool Identifier::isOperatorSlow() const { return Lexer::isOperator(str()); }
+
+bool Identifier::mustAlwaysBeEscaped() const {
+  return Lexer::identifierMustAlwaysBeEscaped(str());
 }
 
 int Identifier::compare(Identifier other) const {
@@ -104,6 +100,11 @@ int Identifier::compare(Identifier other) const {
 }
 
 int DeclName::compare(DeclName other) const {
+  // Fast equality comparsion.
+  if (getOpaqueValue() == other.getOpaqueValue())
+    return 0;
+
+
   // Compare base names.
   if (int result = getBaseName().compare(other.getBaseName()))
     return result;
@@ -117,10 +118,13 @@ int DeclName::compare(DeclName other) const {
       return result;
   }
 
-  if (argNames.size() == otherArgNames.size())
-    return 0;
+  if (argNames.size() != otherArgNames.size())
+    return argNames.size() < otherArgNames.size() ? -1 : 1;
 
-  return argNames.size() < otherArgNames.size() ? -1 : 1;
+  // Order based on if it is compound name or not.
+  assert(isSimpleName() != other.isSimpleName() &&
+         "equality should be covered by opaque value comparsion");
+  return isSimpleName() ? -1 : 1;
 }
 
 static bool equals(ArrayRef<Identifier> idents, ArrayRef<StringRef> strings) {
@@ -162,9 +166,15 @@ StringRef DeclName::getString(llvm::SmallVectorImpl<char> &scratch,
 }
 
 llvm::raw_ostream &DeclName::print(llvm::raw_ostream &os,
-                                   bool skipEmptyArgumentNames) const {
+                                   bool skipEmptyArgumentNames,
+                                   bool escapeIfNeeded) const {
   // Print the base name.
-  os << getBaseName();
+  auto baseName = getBaseName();
+  if (escapeIfNeeded && baseName.mustAlwaysBeEscaped()) {
+    os << "`" << baseName << "`";
+  } else {
+    os << baseName;
+  }
 
   // If this is a simple name, we're done.
   if (isSimpleName())
@@ -189,8 +199,13 @@ llvm::raw_ostream &DeclName::print(llvm::raw_ostream &os,
 
   // Print the argument names.
   os << "(";
-  for (auto c : getArgumentNames()) {
-    os << c << ':';
+  for (auto argName : getArgumentNames()) {
+    if (escapeIfNeeded && argName.mustAlwaysBeEscaped()) {
+      os << "`" << argName << "`";
+    } else {
+      os << argName;
+    }
+    os << ':';
   }
   os << ")";
   return os;
@@ -206,17 +221,27 @@ void DeclNameRef::dump() const {
 }
 
 StringRef DeclNameRef::getString(llvm::SmallVectorImpl<char> &scratch,
-                             bool skipEmptyArgumentNames) const {
-  return FullName.getString(scratch, skipEmptyArgumentNames);
+                                 bool skipEmptyArgumentNames) const {
+  {
+    llvm::raw_svector_ostream out(scratch);
+    print(out, skipEmptyArgumentNames);
+  }
+
+  return StringRef(scratch.data(), scratch.size());
 }
 
-llvm::raw_ostream &DeclNameRef::print(llvm::raw_ostream &os,
-                                  bool skipEmptyArgumentNames) const {
-  return FullName.print(os, skipEmptyArgumentNames);
+llvm::raw_ostream &
+DeclNameRef::print(llvm::raw_ostream &os,
+                   bool skipEmptyArgumentNames) const {
+  if (hasModuleSelector())
+    os << getModuleSelector() << "::";
+  return getFullName().print(os, skipEmptyArgumentNames);
 }
 
 llvm::raw_ostream &DeclNameRef::printPretty(llvm::raw_ostream &os) const {
-  return FullName.printPretty(os);
+  if (hasModuleSelector())
+    os << getModuleSelector() << "::";
+  return getFullName().printPretty(os);
 }
 
 ObjCSelector::ObjCSelector(ASTContext &ctx, unsigned numArgs,

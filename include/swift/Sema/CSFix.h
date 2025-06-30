@@ -409,7 +409,7 @@ enum class FixKind : uint8_t {
   AllowAssociatedValueMismatch,
 
   /// Produce an error for not getting a compile-time constant
-  NotCompileTimeConst,
+  NotCompileTimeLiteral,
 
   /// Ignore a type mismatch while trying to infer generic parameter type
   /// from default expression.
@@ -483,6 +483,13 @@ enum class FixKind : uint8_t {
   /// sending result, but is passed a function typed parameter without a sending
   /// result.
   AllowSendingMismatch,
+
+  /// Ignore when an 'InlineArray' literal has mismatched number of elements to
+  /// the type it's attempting to bind to.
+  AllowInlineArrayLiteralCountMismatch,
+
+  /// Ignore that a conformance is isolated but is not allowed to be.
+  IgnoreIsolatedConformance,
 };
 
 class ConstraintFix {
@@ -551,6 +558,11 @@ public:
 
   virtual bool diagnoseForAmbiguity(CommonFixesArray commonFixes) const {
     return false;
+  }
+
+  template <typename E>
+  bool directlyAt() const {
+    return getLocator()->directlyAt<E>();
   }
 
   void print(llvm::raw_ostream &Out) const;
@@ -2001,12 +2013,15 @@ class AllowInvalidRefInKeyPath final : public ConstraintFix {
     // Allow a reference to a declaration with mutating getter as
     // a key path component.
     MutatingGetter,
-    // Allow a reference to a method (instance or static) as
-    // a key path component.
+    // Allow a reference to a mutating method.
     Method,
     // Allow a reference to a initializer instance as a key path
     // component.
     Initializer,
+    // Allow a reference to an enum case as a key path component.
+    MutatingMethod,
+    // Allow a reference to an async or throwing method.
+    AsyncOrThrowsMethod,
     // Allow a reference to an enum case as a key path component.
     EnumCase,
   } Kind;
@@ -2036,6 +2051,11 @@ public:
       return "allow reference to an init method as a key path component";
     case RefKind::EnumCase:
       return "allow reference to an enum case as a key path component";
+    case RefKind::MutatingMethod:
+      return "allow reference to mutating method as a key path component";
+    case RefKind::AsyncOrThrowsMethod:
+      return "allow reference to async or throwing method as a key path "
+             "component";
     }
     llvm_unreachable("covered switch");
   }
@@ -2077,20 +2097,20 @@ public:
   }
 };
 
-class NotCompileTimeConst final : public ContextualMismatch {
-  NotCompileTimeConst(ConstraintSystem &cs, Type paramTy, ConstraintLocator *locator);
+class NotCompileTimeLiteral final : public ContextualMismatch {
+  NotCompileTimeLiteral(ConstraintSystem &cs, Type paramTy, ConstraintLocator *locator);
 
 public:
-  std::string getName() const override { return "replace with an literal"; }
+  std::string getName() const override { return "replace with a literal"; }
 
   bool diagnose(const Solution &solution, bool asNote = false) const override;
 
-  static NotCompileTimeConst *create(ConstraintSystem &cs,
-                                     Type paramTy,
-                                     ConstraintLocator *locator);
+  static NotCompileTimeLiteral *create(ConstraintSystem &cs,
+                                       Type paramTy,
+                                       ConstraintLocator *locator);
 
   static bool classof(const ConstraintFix *fix) {
-    return fix->getKind() == FixKind::NotCompileTimeConst;
+    return fix->getKind() == FixKind::NotCompileTimeLiteral;
   }
 };
 
@@ -3834,6 +3854,59 @@ public:
 
   static bool classof(const ConstraintFix *fix) {
     return fix->getKind() == FixKind::IgnoreKeyPathSubscriptIndexMismatch;
+  }
+};
+
+class AllowInlineArrayLiteralCountMismatch final : public ConstraintFix {
+  Type lhsCount, rhsCount;
+
+  AllowInlineArrayLiteralCountMismatch(ConstraintSystem &cs, Type lhsCount,
+                                Type rhsCount, ConstraintLocator *locator)
+      : ConstraintFix(cs, FixKind::AllowInlineArrayLiteralCountMismatch, locator),
+        lhsCount(lhsCount), rhsCount(rhsCount) {}
+
+public:
+  std::string getName() const override {
+    return "allow vector literal count mismatch";
+  }
+
+  bool diagnose(const Solution &solution, bool asNote = false) const override;
+
+  static AllowInlineArrayLiteralCountMismatch *
+  create(ConstraintSystem &cs, Type lhsCount, Type rhsCount,
+         ConstraintLocator *locator);
+
+  static bool classof(const ConstraintFix *fix) {
+    return fix->getKind() == FixKind::AllowInlineArrayLiteralCountMismatch;
+  }
+};
+
+class IgnoreIsolatedConformance : public ConstraintFix {
+  ProtocolConformance *conformance;
+
+  IgnoreIsolatedConformance(ConstraintSystem &cs,
+                            ConstraintLocator *locator,
+                            ProtocolConformance *conformance)
+      : ConstraintFix(cs, FixKind::IgnoreIsolatedConformance, locator),
+        conformance(conformance) { }
+
+public:
+  std::string getName() const override {
+    return "ignore isolated conformance";
+  }
+
+  bool diagnose(const Solution &solution, bool asNote = false) const override;
+
+  bool diagnoseForAmbiguity(CommonFixesArray commonFixes) const override {
+    return diagnose(*commonFixes.front().first);
+  }
+
+  static IgnoreIsolatedConformance *create(ConstraintSystem &cs,
+                                           ConstraintLocator *locator,
+                                           ProtocolConformance *conformance);
+
+  static bool classof(const ConstraintFix *fix) {
+    return fix->getKind() == FixKind::IgnoreIsolatedConformance;
   }
 };
 

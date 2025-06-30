@@ -13,6 +13,7 @@
 // This file implements support for generics.
 //
 //===----------------------------------------------------------------------===//
+#include "TypeCheckConcurrency.h"
 #include "TypeCheckProtocol.h"
 #include "TypeCheckType.h"
 #include "TypeChecker.h"
@@ -119,7 +120,7 @@ OpaqueResultTypeRequest::evaluate(Evaluator &evaluator,
         /*addedRequirements=*/{},
         /*inferenceSources=*/{},
         repr->getLoc(),
-        /*isExtension=*/false,
+        /*forExtension=*/nullptr,
         /*allowInverses=*/true};
 
     interfaceSignature = evaluateOrDefault(
@@ -141,7 +142,7 @@ OpaqueResultTypeRequest::evaluate(Evaluator &evaluator,
     for (unsigned i = 0; i < opaqueReprs.size(); ++i) {
       auto *currentRepr = opaqueReprs[i];
 
-      if( auto opaqueReturn = dyn_cast<OpaqueReturnTypeRepr>(currentRepr) ) {
+      if (auto opaqueReturn = dyn_cast<OpaqueReturnTypeRepr>(currentRepr)) {
         // Usually, we resolve the opaque constraint and bail if it isn't a class
         // or existential type (see below). However, in this case we know we will
         // fail, so we can bail early and provide a better diagnostic.
@@ -162,13 +163,13 @@ OpaqueResultTypeRequest::evaluate(Evaluator &evaluator,
         }
       }
 
-      auto *paramType = GenericTypeParamType::getType(opaqueSignatureDepth, i,
-                                                      ctx);
+      auto *paramType = GenericTypeParamType::getOpaqueResultType(
+          opaqueSignatureDepth, i, ctx);
       genericParamTypes.push_back(paramType);
     
       TypeRepr *constraint = currentRepr;
       
-      if (auto opaqueReturn = dyn_cast<OpaqueReturnTypeRepr>(currentRepr)){
+      if (auto opaqueReturn = dyn_cast<OpaqueReturnTypeRepr>(currentRepr)) {
         constraint = opaqueReturn->getConstraint();
       }
       // Try to resolve the constraint repr in the parent decl context. It
@@ -312,31 +313,15 @@ void TypeChecker::checkProtocolSelfRequirements(ValueDecl *decl) {
   }
 }
 
-/// All generic parameters of a generic function must be referenced in the
-/// declaration's type, otherwise we have no way to infer them.
-void TypeChecker::checkReferencedGenericParams(GenericContext *dc) {
-  // Don't do this check for accessors: they're not used directly, so we
-  // never need to infer their generic arguments.  This is mostly a
-  // compile-time optimization, but it also avoids problems with accessors
-  // like 'read' and 'modify' that would arise due to yields not being
-  // part of the formal type.
-  if (isa<AccessorDecl>(dc))
-    return;
-
-  auto *genericParams = dc->getGenericParams();
-  auto genericSig = dc->getGenericSignatureOfContext();
-  if (!genericParams)
-    return;
-
-  auto *decl = cast<ValueDecl>(dc->getInnermostDeclarationDeclContext());
+void TypeChecker::collectReferencedGenericParams(Type ty, SmallPtrSet<CanType, 4> &referenced) {
 
   // A helper class to collect referenced generic type parameters
   // and dependent member types.
   class ReferencedGenericTypeWalker : public TypeWalker {
-    SmallPtrSet<CanType, 4> ReferencedGenericParams;
+    SmallPtrSet<CanType, 4> &ReferencedGenericParams;
 
   public:
-    ReferencedGenericTypeWalker() {}
+    ReferencedGenericTypeWalker(SmallPtrSet<CanType, 4> &referenced) : ReferencedGenericParams(referenced) {}
     Action walkToTypePre(Type ty) override {
       // Find generic parameters or dependent member types.
       // Once such a type is found, don't recurse into its children.
@@ -367,24 +352,39 @@ void TypeChecker::checkReferencedGenericParams(GenericContext *dc) {
 
       return Action::Continue;
     }
-
-    SmallPtrSetImpl<CanType> &getReferencedGenericParams() {
-      return ReferencedGenericParams;
-    }
   };
 
-  // Collect all generic params referenced in parameter types and
-  // return type.
-  ReferencedGenericTypeWalker paramsAndResultWalker;
-  auto *funcTy = decl->getInterfaceType()->castTo<GenericFunctionType>();
-  for (const auto &param : funcTy->getParams())
-    param.getPlainType().walk(paramsAndResultWalker);
-  funcTy->getResult().walk(paramsAndResultWalker);
+  ty.walk(ReferencedGenericTypeWalker(referenced));
+}
+
+/// All generic parameters of a generic function must be referenced in the
+/// declaration's type, otherwise we have no way to infer them.
+void TypeChecker::checkReferencedGenericParams(GenericContext *dc) {
+  // Don't do this check for accessors: they're not used directly, so we
+  // never need to infer their generic arguments.  This is mostly a
+  // compile-time optimization, but it also avoids problems with accessors
+  // like 'read' and 'modify' that would arise due to yields not being
+  // part of the formal type.
+  if (isa<AccessorDecl>(dc))
+    return;
+
+  auto *genericParams = dc->getGenericParams();
+  auto genericSig = dc->getGenericSignatureOfContext();
+  if (!genericParams)
+    return;
+
+  auto *decl = cast<ValueDecl>(dc->getInnermostDeclarationDeclContext());
 
   // Set of generic params referenced in parameter types,
   // return type or requirements.
-  auto &referencedGenericParams =
-      paramsAndResultWalker.getReferencedGenericParams();
+  SmallPtrSet<CanType, 4> referencedGenericParams;
+
+  // Collect all generic params referenced in parameter types and
+  // return type.
+  auto *funcTy = decl->getInterfaceType()->castTo<GenericFunctionType>();
+  for (const auto &param : funcTy->getParams())
+    collectReferencedGenericParams(param.getPlainType(), referencedGenericParams);
+  collectReferencedGenericParams(funcTy->getResult(), referencedGenericParams);
 
   // Check if at least one of the generic params in the requirement refers
   // to an already referenced generic parameter. If this is the case,
@@ -408,13 +408,11 @@ void TypeChecker::checkReferencedGenericParams(GenericContext *dc) {
     }
 
     // Collect generic parameter types referenced by types used in a requirement.
-    ReferencedGenericTypeWalker walker;
+    SmallPtrSet<CanType, 4> genericParamsUsedByRequirementTypes;
     if (first && first->hasTypeParameter())
-      first.walk(walker);
+      collectReferencedGenericParams(first, genericParamsUsedByRequirementTypes);
     if (second && second->hasTypeParameter())
-      second.walk(walker);
-    auto &genericParamsUsedByRequirementTypes =
-        walker.getReferencedGenericParams();
+      collectReferencedGenericParams(second, genericParamsUsedByRequirementTypes);
 
     // If at least one of the collected generic types or a root generic
     // parameter of dependent member types is known to be referenced by
@@ -689,7 +687,6 @@ GenericSignatureRequest::evaluate(Evaluator &evaluator,
   SmallVector<TypeBase *, 2> inferenceSources;
   SmallVector<Requirement, 2> extraReqs;
   SourceLoc loc;
-  bool inferInvertibleReqs = true;
 
   if (auto VD = dyn_cast<ValueDecl>(GC->getAsDecl())) {
     loc = VD->getLoc();
@@ -714,10 +711,8 @@ GenericSignatureRequest::evaluate(Evaluator &evaluator,
                                         /*unboundTyOpener*/ nullptr,
                                         /*placeholderHandler*/ nullptr,
                                         /*packElementOpener*/ nullptr);
-      auto params = func ? func->getParameters()
-                      : subscr ? subscr->getIndices()
-                      : macro->parameterList;
-      for (auto param : *params) {
+
+      for (auto param : *VD->getParameterList()) {
         auto *typeRepr = param->getTypeRepr();
         if (typeRepr == nullptr)
             continue;
@@ -727,7 +722,7 @@ GenericSignatureRequest::evaluate(Evaluator &evaluator,
         if (auto *specifier = dyn_cast<SpecifierTypeRepr>(typeRepr))
           typeRepr = specifier->getBase();
 
-        if (auto *packExpansion = dyn_cast<VarargTypeRepr>(typeRepr)) {
+        if (isa<VarargTypeRepr>(typeRepr)) {
           paramOptions.setContext(TypeResolverContext::VariadicFunctionInput);
         } else {
           paramOptions.setContext(TypeResolverContext::FunctionInput);
@@ -787,20 +782,6 @@ GenericSignatureRequest::evaluate(Evaluator &evaluator,
   } else if (auto *ext = dyn_cast<ExtensionDecl>(GC)) {
     loc = ext->getLoc();
 
-    // If the extension introduces conformance to invertible protocol IP, do not
-    // infer any conditional requirements that the generic parameters to conform
-    // to invertible protocols. This forces people to write out the conditions.
-    inferInvertibleReqs = !ext->isAddingConformanceToInvertible();
-
-    // FIXME: to workaround a reverse condfail, always infer the requirements if
-    //  the extension is in a swiftinterface file. This is temporary and should
-    //  be removed soon. (rdar://130424971)
-    if (auto *sf = ext->getOutermostParentSourceFile()) {
-      if (sf->Kind == SourceFileKind::Interface
-          && !ctx.LangOpts.hasFeature(Feature::SE427NoInferenceOnExtension))
-        inferInvertibleReqs = true;
-    }
-
     collectAdditionalExtensionRequirements(ext->getExtendedType(), extraReqs);
 
     auto *extendedNominal = ext->getExtendedNominal();
@@ -838,8 +819,8 @@ GenericSignatureRequest::evaluate(Evaluator &evaluator,
       parentSig.getPointer(),
       genericParams, WhereClauseOwner(GC),
       extraReqs, inferenceSources, loc,
-      /*isExtension=*/isa<ExtensionDecl>(GC),
-      /*allowInverses=*/inferInvertibleReqs};
+      /*forExtension=*/dyn_cast<ExtensionDecl>(GC),
+      /*allowInverses=*/true};
   return evaluateOrDefault(ctx.evaluator, request,
                            GenericSignatureWithError()).getPointer();
 }
@@ -920,7 +901,7 @@ void TypeChecker::diagnoseRequirementFailure(
   const auto &req = reqFailureInfo.Req;
   const auto &substReq = reqFailureInfo.SubstReq;
 
-  Diag<Type, Type, Type> diagnostic;
+  std::optional<Diag<Type, Type, Type>> diagnostic;
   Diag<Type, Type, StringRef> diagnosticNote;
 
   const auto reqKind = req.getKind();
@@ -938,6 +919,28 @@ void TypeChecker::diagnoseRequirementFailure(
     break;
 
   case RequirementKind::Conformance: {
+    // If this was a failure due to isolated conformances conflicting with
+    // a Sendable or MetatypeSendable requirement, diagnose that.
+    if (reqFailureInfo.IsolatedConformanceProto) {
+      ASTContext &ctx =
+          reqFailureInfo.IsolatedConformanceProto->getASTContext();
+      auto isolatedConformanceRef = reqFailureInfo.IsolatedConformances.front();
+      if (isolatedConformanceRef.isConcrete()) {
+        auto isolatedConformance = isolatedConformanceRef.getConcrete();
+        ctx.Diags.diagnose(
+            errorLoc, diag::isolated_conformance_with_sendable,
+            isolatedConformance->getType(),
+            isolatedConformance->getProtocol()->getName(),
+            reqFailureInfo
+              .IsolatedConformanceProto->isSpecificProtocol(
+                KnownProtocolKind::SendableMetatype),
+            req.getFirstType(),
+            isolatedConformance->getIsolation());
+        diagnosticNote = diag::type_does_not_inherit_or_conform_requirement;
+        break;
+      }
+    }
+
     diagnoseConformanceFailure(substReq.getFirstType(),
                                substReq.getProtocolDecl(), nullptr, errorLoc);
 
@@ -966,9 +969,12 @@ void TypeChecker::diagnoseRequirementFailure(
   }
 
   ASTContext &ctx = targetTy->getASTContext();
-  // FIXME: Poor source-location information.
-  ctx.Diags.diagnose(errorLoc, diagnostic, targetTy, substReq.getFirstType(),
-                     substSecondTy);
+
+  if (diagnostic) {
+    // FIXME: Poor source-location information.
+    ctx.Diags.diagnose(errorLoc, *diagnostic, targetTy, substReq.getFirstType(),
+                       substSecondTy);
+  }
 
   const auto genericParamBindingsText = gatherGenericParamBindingsText(
       {req.getFirstType(), secondTy}, genericParams, substitutions);
@@ -981,6 +987,7 @@ void TypeChecker::diagnoseRequirementFailure(
 }
 
 CheckGenericArgumentsResult TypeChecker::checkGenericArgumentsForDiagnostics(
+    GenericSignature signature,
     ArrayRef<Requirement> requirements,
     TypeSubstitutionFn substitutions) {
   using ParentConditionalConformances =
@@ -1019,7 +1026,9 @@ CheckGenericArgumentsResult TypeChecker::checkGenericArgumentsForDiagnostics(
     auto substReq = item.SubstReq;
 
     SmallVector<Requirement, 2> subReqs;
-    switch (substReq.checkRequirement(subReqs, /*allowMissing=*/true)) {
+    SmallVector<ProtocolConformanceRef, 2> isolatedConformances;
+    switch (substReq.checkRequirement(subReqs, /*allowMissing=*/true,
+                                      &isolatedConformances)) {
     case CheckRequirementResult::Success:
       break;
 
@@ -1050,6 +1059,22 @@ CheckGenericArgumentsResult TypeChecker::checkGenericArgumentsForDiagnostics(
     case CheckRequirementResult::SubstitutionFailure:
       hadSubstFailure = true;
       break;
+    }
+
+    if (!isolatedConformances.empty() && signature) {
+      // Dig out the original type parameter for the requirement.
+      // FIXME: req might not be the right pre-substituted requirement,
+      // if this came from a conditional requirement.
+      for (const auto &isolatedConformance : isolatedConformances) {
+        (void)isolatedConformance;
+        if (auto failed =
+                signature->prohibitsIsolatedConformance(req.getFirstType())) {
+            return CheckGenericArgumentsResult::createIsolatedConformanceFailure(
+              req, substReq,
+              TinyPtrVector<ProtocolConformanceRef>(isolatedConformances),
+              failed->second);
+        }
+      }
     }
   }
 
@@ -1141,11 +1166,6 @@ Type StructuralTypeRequest::evaluate(Evaluator &evaluator,
                                               /*placeholderHandler*/ nullptr,
                                               /*packElementOpener*/ nullptr)
           .resolveType(underlyingTypeRepr);
-
-  // Don't build a generic siganture for a protocol extension, because this
-  // request might be evaluated while building a protocol requirement signature.
-  if (parentDC->getSelfProtocolDecl())
-    return result;
 
   Type parent;
   if (parentDC->isTypeContext())

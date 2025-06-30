@@ -191,7 +191,7 @@ documentation, please create a thread on the Swift forums under the
 
 ### ABI
 
-- [CallConvSummary.rst](/docs/ABI/CallConvSummary.rst):
+- [CallingConventionSummary.rst](/docs/ABI/CallingConventionSummary.rst):
 	A concise summary of the calling conventions used for C/C++, Objective-C
 	and Swift on Apple platforms.  Contains references to source documents,
 	where further detail is required.
@@ -334,11 +334,11 @@ provide greater clarity to contributors wanting to add new documentation.
   It might also be valuable to introduce the tips in context, and have the
   explanation link to all the different tips.
 - [Diagnostics.md](/docs/Diagnostics.md):
-  Describes how to write diagnostic messages and associated educational notes.
+  Describes how to write diagnostic messages and associated documentation.
   TODO: Consider splitting into how-tos and recommended practices.
   For example, we could have a how-to guide on adding a new diagnostic,
   and have a recommended practices page which explains the writing style
-  for diagnostics and educational notes.
+  for diagnostics and diagnostic groups.
 - [HowSwiftImportsCAPIs.md](/docs/HowSwiftImportsCAPIs.md):
   Contains a thorough description of the mapping between C/ObjC entities and
   Swift entities.

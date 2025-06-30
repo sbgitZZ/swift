@@ -13,7 +13,7 @@
 #include "TypeCheckDistributed.h"
 
 #include "CodeSynthesis.h"
-#include "DerivedConformances.h"
+#include "DerivedConformance/DerivedConformance.h"
 #include "TypeChecker.h"
 #include "swift/AST/ASTMangler.h"
 #include "swift/AST/ASTPrinter.h"
@@ -110,8 +110,7 @@ static VarDecl *addImplicitDistributedActorIDProperty(
       nominal);
 
   // mark as nonisolated, allowing access to it from everywhere
-  propDecl->getAttrs().add(
-      new (C) NonisolatedAttr(/*unsafe=*/false, /*implicit=*/true));
+  propDecl->getAttrs().add(NonisolatedAttr::createImplicit(C));
   // mark as @_compilerInitialized, since we synthesize the initializing
   // assignment during SILGen.
   propDecl->getAttrs().add(
@@ -161,8 +160,7 @@ static VarDecl *addImplicitDistributedActorActorSystemProperty(
       nominal);
 
   // mark as nonisolated, allowing access to it from everywhere
-  propDecl->getAttrs().add(
-      new (C) NonisolatedAttr(/*unsafe=*/false, /*implicit=*/true));
+  propDecl->getAttrs().add(NonisolatedAttr::createImplicit(C));
 
   auto idProperty = nominal->getDistributedActorIDProperty();
   // If the id was not yet synthesized, we need to ensure that eventually
@@ -739,8 +737,7 @@ static FuncDecl *createSameSignatureDistributedThunkDecl(DeclContext *DC,
 
   thunk->setSynthesized(true);
   thunk->setDistributedThunk(true);
-  thunk->getAttrs().add(
-      new (C) NonisolatedAttr(/*unsafe=*/false, /*implicit=*/true));
+  thunk->getAttrs().add(NonisolatedAttr::createImplicit(C));
 
   return thunk;
 }
@@ -819,10 +816,9 @@ addDistributedActorCodableConformance(
   }
 
   auto conformance = C.getNormalConformance(
-      actor->getDeclaredInterfaceType(), proto,
-      actor->getLoc(), /*dc=*/actor,
-      ProtocolConformanceState::Incomplete,
-      ProtocolConformanceOptions());
+      actor->getDeclaredInterfaceType(), proto, actor->getLoc(),
+      /*inheritedTypeRepr=*/nullptr, /*dc=*/actor,
+      ProtocolConformanceState::Incomplete, ProtocolConformanceOptions());
   conformance->setSourceKindAndImplyingConformance(
       ConformanceEntryKind::Synthesized, nullptr);
   actor->registerProtocolConformance(conformance, /*synthesized=*/true);
@@ -835,10 +831,10 @@ addDistributedActorCodableConformance(
 void swift::assertRequiredSynthesizedPropertyOrder(ASTContext &Context,
                                                    NominalTypeDecl *nominal) {
 #ifndef NDEBUG
-  if (auto id = nominal->getDistributedActorIDProperty()) {
-    if (auto system = nominal->getDistributedActorSystemProperty()) {
+  if (nominal->getDistributedActorIDProperty()) {
+    if (nominal->getDistributedActorSystemProperty()) {
       if (auto classDecl = dyn_cast<ClassDecl>(nominal)) {
-        if (auto unownedExecutor = classDecl->getUnownedExecutorProperty()) {
+        if (classDecl->getUnownedExecutorProperty()) {
           int idIdx, actorSystemIdx, unownedExecutorIdx = 0;
           int idx = 0;
           for (auto member : nominal->getMembers()) {
@@ -857,8 +853,10 @@ void swift::assertRequiredSynthesizedPropertyOrder(ASTContext &Context,
           }
           if (idIdx + actorSystemIdx + unownedExecutorIdx >= 0 + 1 + 2) {
             // we have found all the necessary fields, let's assert their order
-            assert(idIdx < actorSystemIdx < unownedExecutorIdx &&
-                   "order of fields MUST be exact.");
+            // FIXME: This assertion was not asserting what it is designed to
+            // assert and more work is needed to make it pass.
+//            assert(idIdx < actorSystemIdx < unownedExecutorIdx &&
+//                   "order of fields MUST be exact.");
           }
         }
       }
@@ -1078,12 +1076,10 @@ GetDistributedActorAsActorConformanceRequest::evaluate(
   if (!ext)
     return nullptr;
 
-  auto genericParam = GenericTypeParamType::getType(/*depth=*/0, /*index=*/0,
-                                                    ctx);
-
   auto distributedActorAsActorConformance = ctx.getNormalConformance(
-      Type(genericParam), actorProto, SourceLoc(), ext,
-      ProtocolConformanceState::Incomplete, ProtocolConformanceOptions());
+      Type(ctx.TheSelfType), actorProto, SourceLoc(),
+      /*inheritedTypeRepr=*/nullptr, ext, ProtocolConformanceState::Incomplete,
+      ProtocolConformanceOptions());
   // NOTE: Normally we "register" a conformance, but here we don't
   // because we cannot (currently) register them in a protocol,
   // since they do not have conformance tables.

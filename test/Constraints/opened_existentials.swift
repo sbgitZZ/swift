@@ -485,6 +485,20 @@ do {
 }
 
 do {
+  class C<T> {}
+  protocol P {}
+
+  func f<T: P>(_: T, _: (() -> any (P & C<T>).Type)? = nil) {}
+  // expected-note@-1 {{required by local function 'f' where 'T' = 'any P'}}
+
+  let p: any P
+  // CHECK-NOT: open_existential_expr {{.*}} location={{.*}}:[[@LINE+1]]:{{[0-9]+}} range=
+  f(p)
+  // expected-error@-1 {{type 'any P' cannot conform to 'P'}}
+  // expected-note@-2 {{only concrete types such as structs, enums and classes can conform to protocols}}
+}
+
+do {
   protocol P {}
 
   func foo<T: P>(_ m: inout T.Type) {}
@@ -538,3 +552,42 @@ do {
     }
   }
 }
+
+// rdar://91922018
+do {
+  func f<E>(_ c: some Collection<E>) -> some Collection<E> {
+    return c
+  }
+  let c: any Collection<Int>
+  let result = f(c)
+  do {
+    var types = SwiftTypePair(typeOf: result, type2: SwiftType<any Collection<Int>>.self)
+    types.assertTypesAreEqual()
+  }
+}
+
+struct G<A>: PP3 {}
+
+protocol PP1 {
+    associatedtype A
+}
+
+extension PP1 {
+    func f(p: any PP2<G<Self.A>>) {
+        p.g(t: self)
+    }
+}
+
+protocol PP2<B> {
+    associatedtype A
+    associatedtype B: PP3 where Self.B.A == Self.A
+}
+
+extension PP2 {
+    func g<T: PP1>(t: T) where Self.B == G<T.A> {}
+}
+
+protocol PP3 {
+    associatedtype A
+}
+

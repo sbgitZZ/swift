@@ -405,8 +405,6 @@ combineSubstitutionMaps(SubstitutionMap firstSubMap,
                         unsigned firstDepth,
                         unsigned secondDepth,
                         GenericSignature genericSig) {
-  auto &ctx = genericSig->getASTContext();
-
   return SubstitutionMap::get(
     genericSig,
     [&](SubstitutableType *type) {
@@ -414,12 +412,8 @@ combineSubstitutionMaps(SubstitutionMap firstSubMap,
       if (gp->getDepth() < firstDepth)
         return QuerySubstitutionMap{firstSubMap}(gp);
 
-      auto *replacement = GenericTypeParamType::get(
-          gp->getParamKind(),
-          gp->getDepth() + secondDepth - firstDepth,
-          gp->getIndex(),
-          gp->getValueType(),
-          ctx);
+      auto *replacement = gp->withDepth(
+          gp->getDepth() + secondDepth - firstDepth);
       return QuerySubstitutionMap{secondSubMap}(replacement);
     },
     // We might not have enough information in the substitution maps alone.
@@ -633,11 +627,13 @@ replaceBeginApplyInst(SILBuilder &builder, SILPassManager *pm, SILLocation loc,
     // Insert any end_borrow if the yielded value before the token's uses.
     SmallVector<SILInstruction *, 4> users(
       makeUserIteratorRange(oldYield->getUses()));
-    auto yieldCastRes = castValueToABICompatibleType(
-      &builder, pm, loc, newYield, newYield->getType(), oldYield->getType(),
-      users);
-    oldYield->replaceAllUsesWith(yieldCastRes.first);
-    changedCFG |= yieldCastRes.second;
+    if (!users.empty()) {
+      auto yieldCastRes = castValueToABICompatibleType(
+        &builder, pm, loc, newYield, newYield->getType(), oldYield->getType(),
+        users);
+      oldYield->replaceAllUsesWith(yieldCastRes.first);
+      changedCFG |= yieldCastRes.second;
+    }
   }
 
   if (newArgBorrows.empty())
@@ -805,6 +801,24 @@ bool swift::canDevirtualizeClassMethod(FullApplySite applySite, ClassDecl *cd,
     LLVM_DEBUG(llvm::dbgs() << "        FAIL: Trying to devirtualize a "
           "try_apply but vtable entry has no error result.\n");
     return false;
+  }
+
+  // A narrow fix for https://github.com/swiftlang/swift/issues/79318
+  // to make sure that uses of distributed requirement witnesses are
+  // not devirtualized because that results in a loss of the ad-hoc
+  // requirement infomation in the re-created substitution map.
+  //
+  // We have a similar check in `canSpecializeFunction` which presents
+  // specialization for exactly the same reason.
+  //
+  // TODO: A better way to fix this would be to record the ad-hoc conformance
+  // requirement in `RequirementEnvironment` and adjust IRGen to handle it.
+  if (f->hasLocation()) {
+    if (auto *funcDecl =
+            dyn_cast_or_null<FuncDecl>(f->getLocation().getAsDeclContext())) {
+      if (funcDecl->isDistributedWitnessWithAdHocSerializationRequirement())
+        return false;
+    }
   }
 
   return true;
@@ -1036,19 +1050,16 @@ getWitnessMethodSubstitutions(
         }
 
         if (depth < baseDepth) {
-          paramType = GenericTypeParamType::get(paramType->getParamKind(),
-              depth, paramType->getIndex(), paramType->getValueType(), ctx);
-
+          paramType = paramType->withDepth(depth);
           return Type(paramType).subst(baseSubMap);
         }
 
         depth = depth - baseDepth + 1;
 
-        paramType = GenericTypeParamType::get(paramType->getParamKind(),
-            depth, paramType->getIndex(), paramType->getValueType(), ctx);
+        paramType = paramType->withDepth(depth);
         return Type(paramType).subst(origSubMap);
       },
-      [&](CanType type, Type substType, ProtocolDecl *proto) {
+      [&](InFlightSubstitution &IFS, Type type, ProtocolDecl *proto) {
         auto *paramType = type->getRootGenericParam();
         unsigned depth = paramType->getDepth();
 
@@ -1064,31 +1075,27 @@ getWitnessMethodSubstitutions(
 
         if (depth < baseDepth) {
           type = CanType(type.transformRec([&](TypeBase *t) -> std::optional<Type> {
-            if (t == paramType) {
-              return Type(GenericTypeParamType::get(paramType->getParamKind(),
-                  depth, paramType->getIndex(), paramType->getValueType(), ctx));
-            }
+            if (t == paramType)
+              return paramType->withDepth(depth);
 
             assert(!isa<GenericTypeParamType>(t));
             return std::nullopt;
           }));
 
-          return baseSubMap.lookupConformance(type, proto);
+          return baseSubMap.lookupConformance(type->getCanonicalType(), proto);
         }
 
         depth = depth - baseDepth + 1;
 
         type = CanType(type.transformRec([&](TypeBase *t) -> std::optional<Type> {
-          if (t == paramType) {
-            return Type(GenericTypeParamType::get(paramType->getParamKind(),
-                depth, paramType->getIndex(), paramType->getValueType(), ctx));
-          }
+          if (t == paramType)
+            return paramType->withDepth(depth);
 
           assert(!isa<GenericTypeParamType>(t));
           return std::nullopt;
         }));
 
-        return origSubMap.lookupConformance(type, proto);
+        return origSubMap.lookupConformance(type->getCanonicalType(), proto);
       });
 }
 

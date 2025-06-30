@@ -17,6 +17,7 @@
 #include "swift/AST/Stmt.h"
 #include "swift/AST/ASTContext.h"
 #include "swift/AST/ASTWalker.h"
+#include "swift/AST/AvailabilitySpec.h"
 #include "swift/AST/Decl.h"
 #include "swift/AST/Expr.h"
 #include "swift/AST/Pattern.h"
@@ -513,14 +514,10 @@ void LabeledConditionalStmt::setCond(StmtCondition e) {
 /// or `let self = self` condition.
 ///  - If `requiresCaptureListRef` is `true`, additionally requires that the
 ///    RHS of the self condition references a var defined in a capture list.
-///  - If `requireLoadExpr` is `true`, additionally requires that the RHS of
-///    the self condition is a `LoadExpr`.
 bool LabeledConditionalStmt::rebindsSelf(ASTContext &Ctx,
-                                         bool requiresCaptureListRef,
-                                         bool requireLoadExpr) const {
-  return llvm::any_of(getCond(), [&Ctx, requiresCaptureListRef,
-                                  requireLoadExpr](const auto &cond) {
-    return cond.rebindsSelf(Ctx, requiresCaptureListRef, requireLoadExpr);
+                                         bool requiresCaptureListRef) const {
+  return llvm::any_of(getCond(), [&Ctx, requiresCaptureListRef](const auto &cond) {
+    return cond.rebindsSelf(Ctx, requiresCaptureListRef);
   });
 }
 
@@ -528,11 +525,8 @@ bool LabeledConditionalStmt::rebindsSelf(ASTContext &Ctx,
 /// or `let self = self` condition.
 ///  - If `requiresCaptureListRef` is `true`, additionally requires that the
 ///    RHS of the self condition references a var defined in a capture list.
-///  - If `requireLoadExpr` is `true`, additionally requires that the RHS of
-///    the self condition is a `LoadExpr`.
 bool StmtConditionElement::rebindsSelf(ASTContext &Ctx,
-                                       bool requiresCaptureListRef,
-                                       bool requireLoadExpr) const {
+                                       bool requiresCaptureListRef) const {
   auto pattern = getPatternOrNull();
   if (!pattern) {
     return false;
@@ -557,10 +551,6 @@ bool StmtConditionElement::rebindsSelf(ASTContext &Ctx,
   // Check that the RHS expr is exactly `self` and not something else
   Expr *exprToCheckForDRE = getInitializerOrNull();
   if (!exprToCheckForDRE) {
-    return false;
-  }
-
-  if (requireLoadExpr && !isa<LoadExpr>(exprToCheckForDRE)) {
     return false;
   }
 
@@ -616,6 +606,11 @@ PoundAvailableInfo::create(ASTContext &ctx, SourceLoc PoundLoc,
   void *Buffer = ctx.Allocate(size, alignof(PoundAvailableInfo));
   return ::new (Buffer) PoundAvailableInfo(PoundLoc, LParenLoc, queries,
                                            RParenLoc, isUnavailability);
+}
+
+SemanticAvailabilitySpecs PoundAvailableInfo::getSemanticAvailabilitySpecs(
+    const DeclContext *declContext) const {
+  return SemanticAvailabilitySpecs(getQueries(), declContext);
 }
 
 SourceLoc PoundAvailableInfo::getEndLoc() const {
@@ -770,7 +765,7 @@ CaseStmt::CaseStmt(CaseParentKind parentKind, SourceLoc itemIntroducerLoc,
   }
 
   MutableArrayRef<CaseLabelItem> items{getTrailingObjects<CaseLabelItem>(),
-                                       Bits.CaseStmt.NumPatterns};
+                                       static_cast<size_t>(Bits.CaseStmt.NumPatterns)};
 
   // At the beginning mark all of our var decls as being owned by this
   // statement. In the typechecker we wireup the case stmt var decl list since
@@ -934,19 +929,10 @@ CaseStmt *CaseStmt::findNextCaseStmt() const {
 }
 
 SwitchStmt *SwitchStmt::create(LabeledStmtInfo LabelInfo, SourceLoc SwitchLoc,
-                               Expr *SubjectExpr,
-                               SourceLoc LBraceLoc,
-                               ArrayRef<ASTNode> Cases,
-                               SourceLoc RBraceLoc,
-                               SourceLoc EndLoc,
-                               ASTContext &C) {
-#ifndef NDEBUG
-  for (auto N : Cases)
-    assert((N.is<Stmt*>() && isa<CaseStmt>(N.get<Stmt*>())) ||
-           (N.is<Decl*>() && (isa<PoundDiagnosticDecl>(N.get<Decl*>()))));
-#endif
-
-  void *p = C.Allocate(totalSizeToAlloc<ASTNode>(Cases.size()),
+                               Expr *SubjectExpr, SourceLoc LBraceLoc,
+                               ArrayRef<CaseStmt *> Cases, SourceLoc RBraceLoc,
+                               SourceLoc EndLoc, ASTContext &C) {
+  void *p = C.Allocate(totalSizeToAlloc<CaseStmt *>(Cases.size()),
                        alignof(SwitchStmt));
   SwitchStmt *theSwitch = ::new (p) SwitchStmt(LabelInfo, SwitchLoc,
                                                SubjectExpr, LBraceLoc,
@@ -954,7 +940,7 @@ SwitchStmt *SwitchStmt::create(LabeledStmtInfo LabelInfo, SourceLoc SwitchLoc,
                                                EndLoc);
 
   std::uninitialized_copy(Cases.begin(), Cases.end(),
-                          theSwitch->getTrailingObjects<ASTNode>());
+                          theSwitch->getTrailingObjects<CaseStmt *>());
   for (auto *caseStmt : theSwitch->getCases())
     caseStmt->setParentStmt(theSwitch);
 

@@ -44,7 +44,13 @@ extension Context {
     }
   }
 
+  var currentModuleContext: ModuleDecl {
+    _bridged.getCurrentModuleContext().getAs(ModuleDecl.self)
+  }
+
   var moduleIsSerialized: Bool { _bridged.moduleIsSerialized() }
+
+  var moduleHasLoweredAddresses: Bool { _bridged.moduleHasLoweredAddresses() }
 
   /// Enable diagnostics requiring WMO (for @noLocks, @noAllocation
   /// annotations, Embedded Swift, and class specialization). SourceKit is the
@@ -134,7 +140,10 @@ extension MutatingContext {
     return _bridged.createBlockAfter(block.bridged).block
   }
 
-  func erase(instruction: Instruction) {
+  /// Removes and deletes `instruction`.
+  /// If `salvageDebugInfo` is true, compensating `debug_value` instructions are inserted for certain
+  /// kind of instructions.
+  func erase(instruction: Instruction, salvageDebugInfo: Bool = true) {
     if !instruction.isInStaticInitializer {
       verifyIsTransforming(function: instruction.parentFunction)
     }
@@ -146,7 +155,7 @@ extension MutatingContext {
     }
     notifyInstructionsChanged()
 
-    _bridged.eraseInstruction(instruction.bridged)
+    _bridged.eraseInstruction(instruction.bridged, salvageDebugInfo)
   }
 
   func erase(instructionIncludingAllUsers inst: Instruction) {
@@ -158,7 +167,9 @@ extension MutatingContext {
         erase(instructionIncludingAllUsers: use.instruction)
       }
     }
-    erase(instruction: inst)
+    // We rely that after deleting the instruction its operands have no users.
+    // Therefore `salvageDebugInfo` must be turned off because we cannot insert debug_value instructions.
+    erase(instruction: inst, salvageDebugInfo: false)
   }
 
   func erase<S: Sequence>(instructions: S) where S.Element: Instruction {
@@ -320,6 +331,10 @@ struct FunctionPassContext : MutatingContext {
     _bridged.getSwiftArrayDecl().getAs(NominalTypeDecl.self)
   }
 
+  var swiftMutableSpan: NominalTypeDecl {
+    _bridged.getSwiftMutableSpanDecl().getAs(NominalTypeDecl.self)
+  }
+
   func loadFunction(name: StaticString, loadCalleesRecursively: Bool) -> Function? {
     return name.withUTF8Buffer { (nameBuffer: UnsafeBufferPointer<UInt8>) in
       let nameStr = BridgedStringRef(data: nameBuffer.baseAddress, count: nameBuffer.count)
@@ -344,14 +359,6 @@ struct FunctionPassContext : MutatingContext {
 
   fileprivate func notifyEffectsChanged() {
     _bridged.asNotificationHandler().notifyChanges(.effectsChanged)
-  }
-
-  func optimizeMemoryAccesses(in function: Function) -> Bool {
-    if _bridged.optimizeMemoryAccesses(function.bridged) {
-      notifyInstructionsChanged()
-      return true
-    }
-    return false
   }
 
   func eliminateDeadAllocations(in function: Function) -> Bool {
@@ -405,6 +412,12 @@ struct FunctionPassContext : MutatingContext {
     }
   }
 
+  func mangle(withBoxToStackPromotedArguments argIndices: [Int], from original: Function) -> String {
+    argIndices.withBridgedArrayRef { bridgedArgIndices in
+      String(taking: _bridged.mangleWithBoxToStackPromotedArgs(bridgedArgIndices, original.bridged))
+    }
+  }
+
   func createGlobalVariable(name: String, type: Type, linkage: Linkage, isLet: Bool) -> GlobalVariable {
     let gv = name._withBridgedStringRef {
       _bridged.createGlobalVariable($0, type.bridged, linkage.bridged, isLet)
@@ -412,18 +425,17 @@ struct FunctionPassContext : MutatingContext {
     return gv.globalVar
   }
 
-  func createFunctionForClosureSpecialization(from applySiteCallee: Function, withName specializedFunctionName: String, 
-                                              withParams specializedParameters: [ParameterInfo], 
-                                              withSerialization isSerialized: Bool) -> Function 
+  func createSpecializedFunctionDeclaration(from original: Function, withName specializedFunctionName: String, 
+                                            withParams specializedParameters: [ParameterInfo],
+                                            makeThin: Bool = false,
+                                            makeBare: Bool = false) -> Function
   {
     return specializedFunctionName._withBridgedStringRef { nameRef in
       let bridgedParamInfos = specializedParameters.map { $0._bridged }
 
       return bridgedParamInfos.withUnsafeBufferPointer { paramBuf in
-        _bridged.ClosureSpecializer_createEmptyFunctionWithSpecializedSignature(nameRef, paramBuf.baseAddress, 
-                                                                                paramBuf.count, 
-                                                                                applySiteCallee.bridged, 
-                                                                                isSerialized).function
+        _bridged.createSpecializedFunctionDeclaration(nameRef, paramBuf.baseAddress, paramBuf.count,
+                                                      original.bridged, makeThin, makeBare).function
       }
     }
   }
@@ -483,22 +495,6 @@ private extension Instruction {
     }
     return nil
   }
-
-  /// Returns the next interesting location. As it is impossible to set a
-  /// breakpoint on a meta instruction, those are skipped.
-  /// However, we don't want to take a location with different inlining
-  /// information than this instruction, so in that case, we will return the
-  /// location of the meta instruction. If the meta instruction is the only
-  /// instruction in the basic block, we also take its location.
-  var locationOfNextNonMetaInstruction: Location {
-    let location = self.location
-    guard !location.isInlined,
-          let nextLocation = nextNonMetaInstruction?.location,
-          !nextLocation.isInlined else {
-      return location
-    }
-    return nextLocation
-  }
 }
 
 extension Builder {
@@ -518,7 +514,7 @@ extension Builder {
   init(before insPnt: Instruction, _ context: some MutatingContext) {
     context.verifyIsTransforming(function: insPnt.parentFunction)
     self.init(insertAt: .before(insPnt),
-              location: insPnt.locationOfNextNonMetaInstruction,
+              location: insPnt.location,
               context.notifyInstructionChanged, context._bridged.asNotificationHandler())
   }
 
@@ -550,7 +546,7 @@ extension Builder {
   /// TODO: this is incorrect for terminator instructions. Instead use `Builder.insert(after:location:_:insertFunc)`
   /// from OptUtils.swift. Rename this to afterNonTerminator.
   init(after insPnt: Instruction, _ context: some MutatingContext) {
-    self.init(after: insPnt, location: insPnt.locationOfNextNonMetaInstruction, context)
+    self.init(after: insPnt, location: insPnt.location, context)
   }
 
   /// Creates a builder which inserts at the end of `block`, using a custom `location`.
@@ -574,7 +570,7 @@ extension Builder {
     context.verifyIsTransforming(function: block.parentFunction)
     let firstInst = block.instructions.first!
     self.init(insertAt: .before(firstInst),
-              location: firstInst.locationOfNextNonMetaInstruction,
+              location: firstInst.location,
               context.notifyInstructionChanged, context._bridged.asNotificationHandler())
   }
 
@@ -613,6 +609,14 @@ extension BasicBlock {
     return bridged.addFunctionArgument(type.bridged).argument as! FunctionArgument
   }
 
+  func insertFunctionArgument(atPosition: Int, type: Type, ownership: Ownership, decl: ValueDecl? = nil,
+                              _ context: some MutatingContext) -> FunctionArgument
+  {
+    context.notifyInstructionsChanged()
+    return bridged.insertFunctionArgument(atPosition, type.bridged, ownership._bridged,
+                                          (decl as Decl?).bridged).argument as! FunctionArgument
+  }
+
   func eraseArgument(at index: Int, _ context: some MutatingContext) {
     context.notifyInstructionsChanged()
     bridged.eraseArgument(index)
@@ -646,6 +650,18 @@ extension Argument {
   func set(reborrow: Bool, _ context: some MutatingContext) {
     context.notifyInstructionsChanged()
     bridged.setReborrow(reborrow)
+  }
+}
+
+extension FunctionArgument {
+  /// Copies the following flags from `arg`:
+  /// 1. noImplicitCopy
+  /// 2. lifetimeAnnotation
+  /// 3. closureCapture
+  /// 4. parameterPack
+  func copyFlags(from arg: FunctionArgument, _ context: some MutatingContext) {
+    context.notifyInstructionsChanged()
+    bridged.copyFlags(arg.bridged)
   }
 }
 
@@ -755,6 +771,42 @@ extension PointerToAddressInst {
   }
 }
 
+extension CopyAddrInst {
+  func set(isTakeOfSource: Bool, _ context: some MutatingContext) {
+    context.notifyInstructionsChanged()
+    bridged.CopyAddrInst_setIsTakeOfSrc(isTakeOfSource)
+    context.notifyInstructionChanged(self)
+  }
+
+  func set(isInitializationOfDestination: Bool, _ context: some MutatingContext) {
+    context.notifyInstructionsChanged()
+    bridged.CopyAddrInst_setIsInitializationOfDest(isInitializationOfDestination)
+    context.notifyInstructionChanged(self)
+  }
+}
+
+extension MarkDependenceInstruction {
+  func resolveToNonEscaping(_ context: some MutatingContext) {
+    context.notifyInstructionsChanged()
+    bridged.MarkDependenceInstruction_resolveToNonEscaping()
+    context.notifyInstructionChanged(self)
+  }
+
+  func settleToEscaping(_ context: some MutatingContext) {
+    context.notifyInstructionsChanged()
+    bridged.MarkDependenceInstruction_settleToEscaping()
+    context.notifyInstructionChanged(self)
+  }
+}
+
+extension BeginAccessInst {
+  func set(accessKind: BeginAccessInst.AccessKind, context: some MutatingContext) {
+    context.notifyInstructionsChanged()
+    bridged.BeginAccess_setAccessKind(accessKind.rawValue)
+    context.notifyInstructionChanged(self)
+  }
+}
+
 extension TermInst {
   func replaceBranchTarget(from fromBlock: BasicBlock, to toBlock: BasicBlock, _ context: some MutatingContext) {
     context.notifyBranchesChanged()
@@ -797,5 +849,11 @@ extension Function {
   func appendNewBlock(_ context: FunctionPassContext) -> BasicBlock {
     context.notifyBranchesChanged()
     return context._bridged.appendBlock(bridged).block
+  }
+}
+
+extension DeclRef {
+  func calleesAreStaticallyKnowable(_ context: some Context) -> Bool {
+    context._bridged.calleesAreStaticallyKnowable(bridged)
   }
 }

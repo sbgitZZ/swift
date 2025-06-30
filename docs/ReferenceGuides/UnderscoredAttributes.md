@@ -600,6 +600,43 @@ inherit the actor context (i.e. what actor it should be run on) based on the
 declaration site of the closure rather than be non-Sendable. This does not do
 anything if the closure is synchronous.
 
+This works with global actors as expected:
+
+```swift 
+@MainActor
+func test() {
+  Task { /* main actor isolated */ }
+}
+```
+
+However, for the inference to work with instance actors (i.e. `isolated` parameters),
+the closure must capture the isolated parameter explicitly:
+
+```swift 
+func test(actor: isolated (any Actor)) {
+  Task { /* non isolated */ } // !!!
+}
+
+func test(actor: isolated (any Actor)) {
+  Task { // @_inheritActorContext
+    _ = actor // 'actor'-isolated 
+  }
+}
+```
+
+The attribute takes an optional modifier '`always`', which changes this behavior 
+and *always* captures the enclosing isolated context, rather than forcing developers
+to perform the explicit capture themselfes:
+
+```swift
+func test(actor: isolated (any Actor)) {
+  Task.immediate { // @_inheritActorContext(always)
+    // 'actor'-isolated!
+    // (without having to capture 'actor explicitly')
+  }
+}
+```
+
 DISCUSSION: The reason why this does nothing when the closure is synchronous is
 since it does not have the ability to hop to the appropriate executor before it
 is run, so we may create concurrency errors.
@@ -662,7 +699,7 @@ also work as a generic type constraint.
 Indicates that a protocol is a marker protocol. Marker protocols represent some
 meaningful property at compile-time but have no runtime representation.
 
-For more details, see [](https://github.com/swiftlang/swift-evolution/blob/main/proposals/0302-concurrent-value-and-concurrent-closures.md#marker-protocols), which introduces marker protocols.
+For more details, see [SE-0302](https://github.com/swiftlang/swift-evolution/blob/main/proposals/0302-concurrent-value-and-concurrent-closures.md#marker-protocols), which introduces marker protocols.
 At the moment, the language only has one marker protocol: `Sendable`.
 
 Fun fact: Rust has a very similar concept called
@@ -733,7 +770,7 @@ func baz() {
 Additionally, if they are of a tuple or struct type, their stored members
 without observers may also be passed inout as non-ephemeral pointers.
 
-For more details, see the educational note on
+For more details, see the diagnostic group 
 [temporary pointer usage](/userdocs/diagnostics/temporary-pointers.md).
 
 ## `@_nonoverride`

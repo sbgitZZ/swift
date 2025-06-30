@@ -170,15 +170,6 @@ CaptureKind TypeConverter::getDeclCaptureKind(CapturedValue capture,
       return CaptureKind::StorageAddress;
   }
 
-  // Reference storage types can appear in a capture list, which means
-  // we might allocate boxes to store the captures. However, those boxes
-  // have the same lifetime as the closure itself, so we must capture
-  // the box itself and not the payload, even if the closure is noescape,
-  // otherwise they will be destroyed when the closure is formed.
-  if (var->getInterfaceType()->is<ReferenceStorageType>()) {
-    return CaptureKind::Box;
-  }
-
   // For 'let' constants
   if (!var->supportsMutation()) {
     assert(getTypeLowering(
@@ -655,19 +646,29 @@ namespace {
       return visitAbstractTypeParamType(type, origType, isSensitive);
     }
 
-    Type getConcreteReferenceStorageReferent(Type type,
+    Type getConcreteReferenceStorageReferent(Type substType,
                                              AbstractionPattern origType) {
-      if (type->isTypeParameter()) {
-        auto genericSig = origType.getGenericSignature();
-        if (auto concreteType = genericSig->getConcreteType(type))
-          return concreteType;
-        if (auto superclassType = genericSig->getSuperclassBound(type))
-          return superclassType;
-        assert(genericSig->requiresClass(type));
+      substType = substType->getReferenceStorageReferent();
+      origType = origType.getReferenceStorageReferentType();
+
+      if (auto objectType = substType->getOptionalObjectType()) {
+        substType = objectType;
+        origType = origType.getOptionalObjectType();
+      }
+
+      if (substType->isTypeParameter()) {
+        if (auto genericSig = origType.getGenericSignature()) {
+          auto type = origType.getType();
+          if (auto concreteType = genericSig->getConcreteType(type))
+            return concreteType;
+          if (auto superclassType = genericSig->getSuperclassBound(type))
+            return superclassType;
+          assert(genericSig->requiresClass(type));
+        }
         return TC.Context.getAnyObjectType();
       }
 
-      return type;
+      return substType;
     }
 
 #define NEVER_LOADABLE_CHECKED_REF_STORAGE(Name, ...) \
@@ -710,9 +711,7 @@ namespace {
     RetTy visit##Name##StorageType(Can##Name##StorageType type, \
                                    AbstractionPattern origType, \
                                    IsTypeExpansionSensitive_t isSensitive) { \
-      auto referentType = \
-        type->getReferentType()->lookThroughSingleOptionalType(); \
-      auto concreteType = getConcreteReferenceStorageReferent(referentType, origType); \
+      auto concreteType = getConcreteReferenceStorageReferent(type, origType); \
       if (Name##StorageType::get(concreteType, TC.Context) \
             ->isLoadable(Expansion.getResilienceExpansion())) { \
         return asImpl().visitLoadable##Name##StorageType(type, origType, \
@@ -2282,12 +2281,14 @@ namespace {
 
     TypeLowering *handleTrivial(CanType type,
                                 RecursiveProperties properties) {
+      properties = mergeHasPack(HasPack_t(type->hasAnyPack()), properties);
       auto silType = SILType::getPrimitiveObjectType(type);
       return new (TC) TrivialTypeLowering(silType, properties, Expansion);
     }
 
     TypeLowering *handleReference(CanType type,
                                   RecursiveProperties properties) {
+      properties = mergeHasPack(HasPack_t(type->hasAnyPack()), properties);
       auto silType = SILType::getPrimitiveObjectType(type);
       if (type.isForeignReferenceType() &&
           type->getReferenceCounting() == ReferenceCounting::None)
@@ -2299,6 +2300,7 @@ namespace {
 
     TypeLowering *handleMoveOnlyReference(CanType type,
                                           RecursiveProperties properties) {
+      properties = mergeHasPack(HasPack_t(type->hasAnyPack()), properties);
       auto silType = SILType::getPrimitiveObjectType(type);
       return new (TC)
           MoveOnlyReferenceTypeLowering(silType, properties, Expansion);
@@ -2306,6 +2308,7 @@ namespace {
 
     TypeLowering *handleMoveOnlyAddressOnly(CanType type,
                                             RecursiveProperties properties) {
+      properties = mergeHasPack(HasPack_t(type->hasAnyPack()), properties);
       if (!TC.Context.SILOpts.EnableSILOpaqueValues &&
           !TypeLoweringForceOpaqueValueLowering) {
         auto silType = SILType::getPrimitiveAddressType(type);
@@ -2318,13 +2321,15 @@ namespace {
     }
 
     TypeLowering *handleReference(CanType type) {
+      auto properties = RecursiveProperties::forReference();
+      properties = mergeHasPack(HasPack_t(type->hasAnyPack()), properties);
       auto silType = SILType::getPrimitiveObjectType(type);
-      return new (TC) ReferenceTypeLowering(
-          silType, RecursiveProperties::forReference(), Expansion);
+      return new (TC) ReferenceTypeLowering(silType, properties, Expansion);
     }
 
     TypeLowering *handleAddressOnly(CanType type,
                                     RecursiveProperties properties) {
+      properties = mergeHasPack(HasPack_t(type->hasAnyPack()), properties);
       if (!TC.Context.SILOpts.EnableSILOpaqueValues &&
           !TypeLoweringForceOpaqueValueLowering) {
         auto silType = SILType::getPrimitiveAddressType(type);
@@ -2339,6 +2344,7 @@ namespace {
     
     TypeLowering *handleInfinite(CanType type,
                                  RecursiveProperties properties) {
+      properties = mergeHasPack(HasPack_t(type->hasAnyPack()), properties);
       // Infinite types cannot actually be instantiated, so treat them as
       // opaque for code generation purposes.
       properties.setAddressOnly();
@@ -2454,13 +2460,8 @@ namespace {
         // The same should happen if the type was resilient and serialized in
         // another module in the same package with package-cmo enabled, which
         // treats those modules to be in the same resilience domain.
-        auto declModule = D->getModuleContext();
-        bool sameModule = (declModule == &TC.M);
-        bool serializedPackage = declModule != &TC.M &&
-                                 declModule->inSamePackage(&TC.M) &&
-                                 declModule->isResilient() &&
-                                 declModule->serializePackageEnabled();
-        auto inSameResilienceDomain = sameModule || serializedPackage;
+        auto inSameResilienceDomain = D->getModuleContext() == &TC.M ||
+                                      D->bypassResilienceInPackage(&TC.M);
         if (inSameResilienceDomain)
           properties.addSubobject(RecursiveProperties::forResilient());
 
@@ -2732,6 +2733,7 @@ namespace {
     template <class LoadableLoweringClass>
     TypeLowering *handleAggregateByProperties(CanType type,
                                               RecursiveProperties props) {
+      props = mergeHasPack(HasPack_t(type->hasAnyPack()), props);
       if (props.isAddressOnly()) {
         return handleAddressOnly(type, props);
       }
@@ -3072,12 +3074,8 @@ bool TypeConverter::visitAggregateLeaves(
                            origTy.getPackExpansionPatternType(),
                            field, index);
       } else if (auto array = dyn_cast<BuiltinFixedArrayType>(ty)) {
-        auto origBFA = origTy.getAs<BuiltinFixedArrayType>();
-        insertIntoWorklist(
-            array->getElementType(),
-            AbstractionPattern(origTy.getGenericSignatureOrNull(),
-                               origBFA->getElementType()),
-            field, index);
+        insertIntoWorklist(array->getElementType(),
+                           AbstractionPattern::getOpaque(), field, index);
       } else if (auto *decl = ty.getStructOrBoundGenericStruct()) {
         for (auto *structField : decl->getStoredProperties()) {
           auto subMap = ty->getContextSubstitutionMap();
@@ -3225,19 +3223,17 @@ void TypeConverter::verifyTrivialLowering(const TypeLowering &lowering,
 
   if (auto *nominal = substType.getAnyNominal()) {
     auto *module = nominal->getModuleContext();
-    if (module) {
-      if (module->isBuiltFromInterface()) {
+    if (module && module->isBuiltFromInterface()) {
         // Don't verify for types in modules built from interfaces; the feature
         // may not have been enabled in them.
         return;
-      }
-      auto *file = dyn_cast_or_null<FileUnit>(module->getModuleScopeContext());
-      if (file && file->getKind() == FileUnitKind::Source) {
-        auto sourceFile = nominal->getParentSourceFile();
-        if (sourceFile && sourceFile->Kind == SourceFileKind::SIL) {
-          // Don't verify for types in SIL files.
-          return;
-        }
+    }
+    auto *file = nominal->getParentSourceFile();
+    if (file && file->getKind() == FileUnitKind::Source) {
+      auto sourceFile = nominal->getParentSourceFile();
+      if (sourceFile && sourceFile->Kind == SourceFileKind::SIL) {
+        // Don't verify for types in SIL files.
+        return;
       }
     }
   }
@@ -4422,6 +4418,10 @@ TypeConverter::getLoweredLocalCaptures(SILDeclRef fn) {
   // Captured pack element environments.
   llvm::SetVector<GenericEnvironment *> genericEnv;
 
+  // Captured types.
+  SmallVector<CapturedType, 4> capturedTypes;
+  llvm::SmallDenseSet<CanType, 4> alreadyCapturedTypes;
+
   bool capturesGenericParams = false;
   DynamicSelfType *capturesDynamicSelf = nullptr;
   OpaqueValueExpr *capturesOpaqueValue = nullptr;
@@ -4617,6 +4617,13 @@ TypeConverter::getLoweredLocalCaptures(SILDeclRef fn) {
       // Collect non-function captures.
       recordCapture(capture);
     }
+
+    for (const auto &capturedType : captureInfo.getCapturedTypes()) {
+      if (alreadyCapturedTypes.insert(capturedType.getType()->getCanonicalType())
+              .second) {
+        capturedTypes.push_back(capturedType);
+      }
+    }
   };
 
   collectFunctionCaptures = [&](AnyFunctionRef curFn) {
@@ -4668,6 +4675,24 @@ TypeConverter::getLoweredLocalCaptures(SILDeclRef fn) {
 
   collectConstantCaptures(fn);
 
+  // @_inheritActorContext(always) attribute allows implicit
+  // capture of isolation parameter from the context. This
+  // cannot be done as part of computing captures because
+  // isolation is not available at that point because it in
+  // turn depends on captures sometimes.
+  if (auto *closure = fn.getClosureExpr()) {
+    if (closure->alwaysInheritsActorContext()) {
+      auto isolation = closure->getActorIsolation();
+      if (isolation.isActorInstanceIsolated()) {
+        if (auto *var = isolation.getActorInstance()) {
+          recordCapture(CapturedValue(var, /*flags=*/0, SourceLoc()));
+        } else if (auto *actorExpr = isolation.getActorInstanceExpr()) {
+          recordCapture(CapturedValue(actorExpr, /*flags=*/0));
+        }
+      }
+    }
+  }
+
   SmallVector<CapturedValue, 4> resultingCaptures;
   for (auto capturePair : varCaptures) {
     resultingCaptures.push_back(capturePair.second);
@@ -4694,7 +4719,8 @@ TypeConverter::getLoweredLocalCaptures(SILDeclRef fn) {
   // Cache the result.
   CaptureInfo info(Context, resultingCaptures,
                    capturesDynamicSelf, capturesOpaqueValue,
-                   capturesGenericParams, genericEnv.getArrayRef());
+                   capturesGenericParams, genericEnv.getArrayRef(),
+                   capturedTypes);
   auto inserted = LoweredCaptures.insert({fn, info});
   assert(inserted.second && "already in map?!");
   (void)inserted;

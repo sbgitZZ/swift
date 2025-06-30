@@ -191,7 +191,7 @@ func checked_cast_addr_nonactive_result<T: Differentiable>(_ x: T) -> T {
 // CHECK: bb5:
 // CHECK: [VARIED] %18 = argument of bb5 : $Float
 // CHECK: bb6:
-// CHECK: [NONE]   %22 = tuple ()
+// CHECK: [NONE]   %{{.*}} = tuple ()
 
 // CHECK-LABEL: sil hidden [ossa] @${{.*}}checked_cast_addr_nonactive_result{{.*}} : $@convention(thin) <T where T : Differentiable> (@in_guaranteed T) -> @out T {
 // CHECK:   checked_cast_addr_br take_always T in %3 : $*T to Float in %5 : $*Float, bb1, bb2
@@ -798,7 +798,7 @@ func testActiveOptional(_ x: Float) -> Float {
 // CHECK: [NONE]   // function_ref _diagnoseUnexpectedNilOptional(_filenameStart:_filenameLength:_filenameIsASCII:_line:_isImplicitUnwrap:)
 // CHECK: [NONE]   %24 = apply %23(%17, %18, %19, %20, %22) : $@convention(thin) (Builtin.RawPointer, Builtin.Word, Builtin.Int1, Builtin.Word, Builtin.Int1) -> ()
 // CHECK: bb2:
-// CHECK: [ACTIVE] %26 = argument of bb2 : $Float
+// CHECK: [ACTIVE] {{%[0-9]+}} = argument of bb2 : $Float
 
 enum DirectEnum: Differentiable & AdditiveArithmetic {
   case case0

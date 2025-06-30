@@ -2,7 +2,7 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2025 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
 // See https://swift.org/LICENSE.txt for license information
@@ -30,8 +30,10 @@
 #include "swift/AST/SubstitutionMap.h"
 #include "swift/AST/Types.h"
 #include "swift/Basic/Assertions.h"
+#include "swift/Basic/Mangler.h"
 #include "swift/ClangImporter/ClangModule.h"
 #include "swift/IRGen/Linking.h"
+#include "swift/Parse/Lexer.h"
 #include "swift/SIL/FormalLinkage.h"
 #include "swift/SIL/SILModule.h"
 #include "swift/SIL/TypeLowering.h"
@@ -253,34 +255,47 @@ static Flags getMethodDescriptorFlags(ValueDecl *fn) {
     return flags;
   }
 
-  auto kind = [&] {
+  auto kindAndIsCalleeAllocatedCoroutine =
+      [&]() -> std::pair<typename Flags::Kind, bool> {
     auto accessor = dyn_cast<AccessorDecl>(fn);
-    if (!accessor) return Flags::Kind::Method;
+    if (!accessor)
+      return {Flags::Kind::Method, false};
     switch (accessor->getAccessorKind()) {
     case AccessorKind::Get:
-      return Flags::Kind::Getter;
+      return {Flags::Kind::Getter, false};
     case AccessorKind::Set:
-      return Flags::Kind::Setter;
+      return {Flags::Kind::Setter, false};
     case AccessorKind::Read:
-      return Flags::Kind::ReadCoroutine;
+      return {Flags::Kind::ReadCoroutine, false};
     case AccessorKind::Read2:
-      return Flags::Kind::Read2Coroutine;
+      return {Flags::Kind::ReadCoroutine, true};
     case AccessorKind::Modify:
-      return Flags::Kind::ModifyCoroutine;
+      return {Flags::Kind::ModifyCoroutine, false};
     case AccessorKind::Modify2:
-      return Flags::Kind::Modify2Coroutine;
-#define OPAQUE_ACCESSOR(ID, KEYWORD)
-#define ACCESSOR(ID) \
-    case AccessorKind::ID:
+      return {Flags::Kind::ModifyCoroutine, true};
     case AccessorKind::DistributedGet:
+      return {Flags::Kind::Getter, false};
+#define OPAQUE_ACCESSOR(ID, KEYWORD)
+#define ACCESSOR(ID, KEYWORD) case AccessorKind::ID:
 #include "swift/AST/AccessorKinds.def"
       llvm_unreachable("these accessors never appear in protocols or v-tables");
     }
     llvm_unreachable("bad kind");
   }();
-  bool hasAsync = false;
+  auto kind = kindAndIsCalleeAllocatedCoroutine.first;
+
+  // Because no async old-ABI accessor coroutines exist or presumably ever will
+  // (if async coroutines accessors are added, they will presumably be new-ABI),
+  // the pairs {Flags::Kind::ReadCoroutine, isAsync} and
+  // {Flags::Kind::ModifyCoroutine, isAsync} can't mean "async old-ABI
+  // accessor coroutine".  As such, we repurpose that pair to mean "new-ABI
+  // accessor coroutine".  This has the important virtue of resulting in ptrauth
+  // authing/signing coro function pointers as data on old OSes where the bit
+  // means "async" and where adding new accessor kinds requires a back
+  // deployment library.
+  bool hasAsync = kindAndIsCalleeAllocatedCoroutine.second;
   if (auto *afd = dyn_cast<AbstractFunctionDecl>(fn))
-    hasAsync = afd->hasAsync();
+    hasAsync |= afd->hasAsync();
   return Flags(kind).withIsInstance(!fn->isStatic()).withIsAsync(hasAsync);
 }
 
@@ -298,10 +313,15 @@ static void buildMethodDescriptorFields(IRGenModule &IGM,
   if (func->shouldUseObjCDispatch())
     flags = flags.withIsDynamic(true);
 
+  auto *accessor = dyn_cast<AccessorDecl>(func);
+
   // Include the pointer-auth discriminator.
-  if (auto &schema = func->hasAsync()
-                         ? IGM.getOptions().PointerAuth.AsyncSwiftClassMethods
-                         : IGM.getOptions().PointerAuth.SwiftClassMethods) {
+  if (auto &schema =
+          func->hasAsync() ? IGM.getOptions().PointerAuth.AsyncSwiftClassMethods
+          : accessor &&
+                  requiresFeatureCoroutineAccessors(accessor->getAccessorKind())
+              ? IGM.getOptions().PointerAuth.CoroSwiftClassMethods
+              : IGM.getOptions().PointerAuth.SwiftClassMethods) {
     auto discriminator =
       PointerAuthInfo::getOtherDiscriminator(IGM, schema, fn);
     flags = flags.withExtraDiscriminator(discriminator->getZExtValue());
@@ -316,6 +336,9 @@ static void buildMethodDescriptorFields(IRGenModule &IGM,
     auto *impl = entry->getImplementation();
     if (impl->isAsync()) {
       llvm::Constant *implFn = IGM.getAddrOfAsyncFunctionPointer(impl);
+      descriptor.addRelativeAddress(implFn);
+    } else if (impl->getLoweredFunctionType()->isCalleeAllocatedCoroutine()) {
+      llvm::Constant *implFn = IGM.getAddrOfCoroFunctionPointer(impl);
       descriptor.addRelativeAddress(implFn);
     } else {
       llvm::Function *implFn = IGM.getAddrOfSILFunction(impl, NotForDefinition);
@@ -671,8 +694,9 @@ namespace {
     }
     
     void addName() {
-      B.addRelativeAddress(IGM.getAddrOfGlobalString(M->getABIName().str(),
-                                           /*willBeRelativelyAddressed*/ true));
+      B.addRelativeAddress(IGM.getAddrOfGlobalIdentifierString(
+          M->getABIName().str(),
+          /*willBeRelativelyAddressed*/ true));
     }
     
     bool isUniqueDescriptor() {
@@ -906,7 +930,7 @@ namespace {
     }
 
     void addName() {
-      auto nameStr = IGM.getAddrOfGlobalString(Proto->getName().str(),
+      auto nameStr = IGM.getAddrOfGlobalIdentifierString(Proto->getName().str(),
                                            /*willBeRelativelyAddressed*/ true);
       B.addRelativeAddress(nameStr);
     }
@@ -942,8 +966,7 @@ namespace {
         auto flags = Flags(Flags::Kind::AssociatedTypeAccessFunction);
         if (auto &schema = IGM.getOptions().PointerAuth
                               .ProtocolAssociatedTypeAccessFunctions) {
-          addDiscriminator(flags, schema,
-                           AssociatedType(entry.getAssociatedType()));
+          addDiscriminator(flags, schema, entry.getAssociatedType());
         }
 
         // Look for a default witness.
@@ -977,8 +1000,7 @@ namespace {
 
       // Emit the dispatch thunk.
       auto shouldEmitDispatchThunk =
-          (Resilient || IGM.getOptions().WitnessMethodElimination) &&
-          !func.isDistributed();
+          (Resilient || IGM.getOptions().WitnessMethodElimination);
       if (shouldEmitDispatchThunk) {
         IGM.emitDispatchThunk(func);
       }
@@ -1047,26 +1069,13 @@ namespace {
       }
 
       for (auto &entry : pi.getWitnessEntries()) {
-        if (entry.isFunction() &&
-            entry.getFunction().getDecl()->isDistributedGetAccessor()) {
-          // We avoid emitting _distributed_get accessors, as they cannot be
-          // referred to anyway
-          continue;
-        }
-
         if (Resilient) {
           if (entry.isFunction()) {
             // Define the method descriptor.
             SILDeclRef func(entry.getFunction());
 
-            /// Distributed thunks don't need resilience.
-            if (func.isDistributedThunk()) {
-              continue;
-            }
-
             auto *descriptor =
-              B.getAddrOfCurrentPosition(
-                IGM.ProtocolRequirementStructTy);
+                B.getAddrOfCurrentPosition(IGM.ProtocolRequirementStructTy);
             IGM.defineMethodDescriptor(func, Proto, descriptor,
                                        IGM.ProtocolRequirementStructTy);
           }
@@ -1135,6 +1144,9 @@ namespace {
         if (silFunc->isAsync()) {
           return IGM.getAddrOfAsyncFunctionPointer(silFunc);
         }
+        if (silFunc->getLoweredFunctionType()->isCalleeAllocatedCoroutine()) {
+          return IGM.getAddrOfCoroFunctionPointer(silFunc);
+        }
         return IGM.getAddrOfSILFunction(entry.getMethodWitness().Witness,
                                         NotForDefinition);
       }
@@ -1168,14 +1180,17 @@ namespace {
 
       for (auto &entry : DefaultWitnesses->getEntries()) {
         if (!entry.isValid() ||
-            entry.getKind() != SILWitnessTable::AssociatedConformance ||
-            entry.getAssociatedConformanceWitness().Protocol != requirement ||
-            entry.getAssociatedConformanceWitness().Requirement != association)
+            entry.getKind() != SILWitnessTable::AssociatedConformance)
           continue;
 
-        auto witness = entry.getAssociatedConformanceWitness().Witness;
+        auto assocConf = entry.getAssociatedConformanceWitness();
+        if (assocConf.Requirement != association ||
+            assocConf.Witness.getProtocol() != requirement)
+          continue;
+
         AssociatedConformance conformance(Proto, association, requirement);
-        defineDefaultAssociatedConformanceAccessFunction(conformance, witness);
+        defineDefaultAssociatedConformanceAccessFunction(
+            conformance, assocConf.Witness);
         return IGM.getMangledAssociatedConformance(nullptr, conformance);
       }
 
@@ -1242,7 +1257,7 @@ namespace {
     }
 
     void addAssociatedTypeNames() {
-      std::string AssociatedTypeNames;
+      llvm::SmallString<256> AssociatedTypeNames;
 
       auto &pi = IGM.getProtocolInfo(Proto,
                                      ProtocolInfoKind::RequirementSignature);
@@ -1251,7 +1266,13 @@ namespace {
         if (entry.isAssociatedType()) {
           if (!AssociatedTypeNames.empty())
             AssociatedTypeNames += ' ';
-          AssociatedTypeNames += entry.getAssociatedType()->getName().str();
+
+          Identifier name = entry.getAssociatedType()->getName();
+          if (name.mustAlwaysBeEscaped()) {
+            Mangle::Mangler::appendRawIdentifierForRuntime(name.str(), AssociatedTypeNames);
+          } else {
+            AssociatedTypeNames += name.str();
+          }
         }
       }
 
@@ -1277,6 +1298,7 @@ namespace {
       MetadataInitialization;
 
     StringRef UserFacingName;
+    bool IsCxxSpecializedTemplate;
     std::optional<TypeImportInfo<std::string>> ImportInfo;
 
     using super::IGM;
@@ -1370,12 +1392,13 @@ namespace {
 
       // Create placeholders for the counts of the conditional requirements
       // for each conditional conformance to a supressible protocol.
-      unsigned numProtocols = countBitsUsed(protocols.rawBits());
+      unsigned numProtocols = 0;
       using PlaceholderPosition =
           ConstantAggregateBuilderBase::PlaceholderPosition;
       SmallVector<PlaceholderPosition, 2> countPlaceholders;
-      for (unsigned i : range(0, numProtocols)) {
-        (void)i;
+      for (auto kind : protocols) {
+        (void)kind;
+        numProtocols++;
         countPlaceholders.push_back(
             B.addPlaceholderWithSize(IGM.Int16Ty));
       }
@@ -1421,10 +1444,11 @@ namespace {
     void computeIdentity() {
       // Remember the user-facing name.
       UserFacingName = Type->getName().str();
+      IsCxxSpecializedTemplate = false;
 
       // For related entities, set the original type name as the ABI name
       // and remember the related entity tag.
-      StringRef abiName;
+      std::string abiName;
       if (auto *synthesizedTypeAttr =
             Type->getAttrs()
                  .template getAttribute<ClangImporterSynthesizedTypeAttr>()) {
@@ -1441,10 +1465,12 @@ namespace {
         // that each specialization gets its own metadata. A class template
         // specialization's Swift name will always be the mangled name, so just
         // use that.
-        if (auto spec = dyn_cast<clang::ClassTemplateSpecializationDecl>(clangDecl))
+        if (auto spec =
+                dyn_cast<clang::ClassTemplateSpecializationDecl>(clangDecl)) {
           abiName = Type->getName().str();
-        else
-          abiName = clangDecl->getName();
+          IsCxxSpecializedTemplate = true;
+        } else
+          abiName = clangDecl->getQualifiedNameAsString();
 
         // Typedefs and compatibility aliases that have been promoted to
         // their own nominal types need to be marked specially.
@@ -1458,7 +1484,7 @@ namespace {
       // If the ABI name differs from the user-facing name, add it as
       // an override.
       if (!abiName.empty() && abiName != UserFacingName) {
-        getMutableImportInfo().ABIName = std::string(abiName);
+        getMutableImportInfo().ABIName = abiName;
       }
     }
 
@@ -1473,7 +1499,12 @@ namespace {
 
     void addName() {
       SmallString<32> name;
-      name += UserFacingName;
+      if (!IsCxxSpecializedTemplate &&
+          Lexer::identifierMustAlwaysBeEscaped(UserFacingName)) {
+        Mangle::Mangler::appendRawIdentifierForRuntime(UserFacingName, name);
+      } else {
+        name += UserFacingName;
+      }
 
       // Collect the import info if present.
       if (ImportInfo) {
@@ -1488,7 +1519,7 @@ namespace {
       }
       
       auto nameStr = IGM.getAddrOfGlobalString(name,
-                                           /*willBeRelativelyAddressed*/ true);
+                                               /*willBeRelativelyAddressed*/ true);
       B.addRelativeAddress(nameStr);
     }
       
@@ -1589,7 +1620,8 @@ namespace {
     void setCommonFlags(TypeContextDescriptorFlags &flags) {
       setClangImportedFlags(flags);
       setMetadataInitializationKind(flags);
-      setHasCanonicalMetadataPrespecializations(flags);
+      setHasCanonicalMetadataPrespecializationsOrSingletonMetadataPointer(
+          flags);
     }
     
     void setClangImportedFlags(TypeContextDescriptorFlags &flags) {
@@ -1623,8 +1655,11 @@ namespace {
       flags.setMetadataInitialization(MetadataInitialization);
     }
 
-    void setHasCanonicalMetadataPrespecializations(TypeContextDescriptorFlags &flags) {
-      flags.setHasCanonicalMetadataPrespecializations(hasCanonicalMetadataPrespecializations());
+    void setHasCanonicalMetadataPrespecializationsOrSingletonMetadataPointer(
+        TypeContextDescriptorFlags &flags) {
+      flags.setHasCanonicalMetadataPrespecializationsOrSingletonMetadataPointer(
+          hasCanonicalMetadataPrespecializations() ||
+          hasSingletonMetadataPointer());
     }
 
     bool hasCanonicalMetadataPrespecializations() {
@@ -1634,6 +1669,30 @@ namespace {
                             return pair.second ==
                                    TypeMetadataCanonicality::Canonical;
                           });
+    }
+
+    bool hasSingletonMetadataPointer() {
+      if (!IGM.IRGen.Opts.EmitSingletonMetadataPointers)
+        return false;
+
+      bool isGeneric = Type->isGenericContext();
+      bool noInitialization =
+          MetadataInitialization ==
+          TypeContextDescriptorFlags::NoMetadataInitialization;
+      auto isPublic = Type->getFormalAccessScope().isPublic();
+
+      auto kind = asImpl().getContextKind();
+      auto isSupportedKind = kind == ContextDescriptorKind::Class ||
+                             kind == ContextDescriptorKind::Struct ||
+                             kind == ContextDescriptorKind::Enum;
+
+      // Only emit a singleton metadata pointer if:
+      //   The type is not generic (there's no single metadata if it's generic).
+      //   The metadata doesn't require runtime initialization. (The metadata
+      //       can't safely be accessed directly if it does.)
+      //   The type is not public. (If it's public it can be found by symbol.)
+      //   It's a class, struct, or enum.
+      return !isGeneric && noInitialization && !isPublic && isSupportedKind;
     }
 
     void maybeAddMetadataInitialization() {
@@ -1724,6 +1783,14 @@ namespace {
       B.addRelativeAddress(cachingOnceToken);
     }
 
+    void maybeAddSingletonMetadataPointer() {
+      if (hasSingletonMetadataPointer()) {
+        auto type = Type->getDeclaredTypeInContext()->getCanonicalType();
+        auto metadata = IGM.getAddrOfTypeMetadata(type);
+        B.addRelativeAddress(metadata);
+      }
+    }
+
     // Subclasses should provide:
     // ContextDescriptorKind getContextKind();
     // void addLayoutInfo();
@@ -1758,6 +1825,7 @@ namespace {
       super::layout();
       maybeAddCanonicalMetadataPrespecializations();
       addInvertedProtocols();
+      maybeAddSingletonMetadataPointer();
     }
 
     ContextDescriptorKind getContextKind() {
@@ -1766,7 +1834,7 @@ namespace {
     
     void addLayoutInfo() {
       // uint32_t NumFields;
-      B.addInt32(getNumFields(getType()));
+      B.addInt32(countExportableFields(IGM, getType()));
 
       // uint32_t FieldOffsetVectorOffset;
       B.addInt32(FieldVectorOffset / IGM.getPointerSize());
@@ -1832,6 +1900,7 @@ namespace {
       super::layout();
       maybeAddCanonicalMetadataPrespecializations();
       addInvertedProtocols();
+      maybeAddSingletonMetadataPointer();
     }
     
     ContextDescriptorKind getContextKind() {
@@ -1965,6 +2034,8 @@ namespace {
       addObjCResilientClassStubInfo();
       maybeAddCanonicalMetadataPrespecializations();
       addInvertedProtocols();
+      maybeAddSingletonMetadataPointer();
+      maybeAddDefaultOverrideTable();
     }
 
     void addIncompleteMetadataOrRelocationFunction() {
@@ -2006,6 +2077,9 @@ namespace {
         if (getType()->isDefaultActor(IGM.getSwiftModule(),
                                       ResilienceExpansion::Maximal))
           flags.class_setIsDefaultActor(true);
+
+        if (getDefaultOverrideTable())
+          flags.class_setHasDefaultOverrideTable(true);
       }
 
       if (ResilientSuperClassRef) {
@@ -2198,6 +2272,10 @@ namespace {
         if (impl->isAsync()) {
           llvm::Constant *implFn = IGM.getAddrOfAsyncFunctionPointer(impl);
           descriptor.addRelativeAddress(implFn);
+        } else if (impl->getLoweredFunctionType()
+                       ->isCalleeAllocatedCoroutine()) {
+          llvm::Constant *implFn = IGM.getAddrOfCoroFunctionPointer(impl);
+          descriptor.addRelativeAddress(implFn);
         } else {
           llvm::Function *implFn = IGM.getAddrOfSILFunction(impl, NotForDefinition);
           descriptor.addCompactFunctionReference(implFn);
@@ -2206,6 +2284,71 @@ namespace {
         // The method is removed by dead method elimination.
         // It should be never called. We add a pointer to an error function.
         descriptor.addRelativeAddressOrNull(nullptr);
+      }
+
+      descriptor.finishAndAddTo(B);
+    }
+
+    SILDefaultOverrideTable *getDefaultOverrideTable() {
+      auto *table = IGM.getSILModule().lookUpDefaultOverrideTable(getType());
+      if (!table)
+        return nullptr;
+
+      if (table->getEntries().size() == 0)
+        return nullptr;
+
+      return table;
+    }
+
+    void maybeAddDefaultOverrideTable() {
+      auto *table = getDefaultOverrideTable();
+      if (!table)
+        return;
+
+      LLVM_DEBUG(llvm::dbgs() << "Default Override Table entries for "
+                              << getType()->getName() << ":\n";
+                 for (auto entry
+                      : table->getEntries()) {
+                   llvm::dbgs() << "  ";
+                   llvm::dbgs() << "original(" << entry.original << ")";
+                   llvm::dbgs() << " -> ";
+                   llvm::dbgs() << "replacement(" << entry.method << ")";
+                   llvm::dbgs() << " -> ";
+                   llvm::dbgs() << "impl(" << entry.impl->getName() << ")";
+                   llvm::dbgs() << '\n';
+                 });
+
+      B.addInt32(table->getEntries().size());
+
+      for (auto entry : table->getEntries())
+        emitDefaultOverrideDescriptor(entry.method, entry.original, entry.impl);
+    }
+
+    void emitDefaultOverrideDescriptor(SILDeclRef replacement,
+                                       SILDeclRef original, SILFunction *impl) {
+      auto descriptor =
+          B.beginStruct(IGM.MethodDefaultOverrideDescriptorStructTy);
+
+      auto replacementEntity = LinkEntity::forMethodDescriptor(replacement);
+      auto replacementDescriptor =
+          IGM.getAddrOfLLVMVariableOrGOTEquivalent(replacementEntity);
+      descriptor.addRelativeAddress(replacementDescriptor);
+
+      auto originalEntity = LinkEntity::forMethodDescriptor(original);
+      auto originalDescriptor =
+          IGM.getAddrOfLLVMVariableOrGOTEquivalent(originalEntity);
+      descriptor.addRelativeAddress(originalDescriptor);
+
+      if (impl->isAsync()) {
+        llvm::Constant *implFn = IGM.getAddrOfAsyncFunctionPointer(impl);
+        descriptor.addRelativeAddress(implFn);
+      } else if (impl->getLoweredFunctionType()->isCalleeAllocatedCoroutine()) {
+        llvm::Constant *implFn = IGM.getAddrOfCoroFunctionPointer(impl);
+        descriptor.addRelativeAddress(implFn);
+      } else {
+        llvm::Function *implFn =
+            IGM.getAddrOfSILFunction(impl, NotForDefinition);
+        descriptor.addCompactFunctionReference(implFn);
       }
 
       descriptor.finishAndAddTo(B);
@@ -2266,7 +2409,7 @@ namespace {
       B.addInt32(numImmediateMembers);
 
       // uint32_t NumFields;
-      B.addInt32(getNumFields(getType()));
+      B.addInt32(countExportableFields(IGM, getType()));
 
       // uint32_t FieldOffsetVectorOffset;
       B.addInt32(getFieldVectorOffset() / IGM.getPointerSize());
@@ -2733,9 +2876,10 @@ namespace {
             substitutions.lookupConformance(underlyingDependentType, P);
 
         if (underlyingType->hasTypeParameter()) {
-          std::tie(underlyingType, underlyingConformance)
-              = GenericEnvironment::mapConformanceRefIntoContext(
-                    genericEnv, underlyingType, underlyingConformance);
+          underlyingType = genericEnv->mapTypeIntoContext(
+              underlyingType);
+          underlyingConformance = underlyingConformance.subst(
+            genericEnv->getForwardingSubstitutionMap());
         }
 
         return emitWitnessTableRef(IGF, underlyingType->getCanonicalType(),
@@ -3007,7 +3151,7 @@ emitInitializeFieldOffsetVector(SILType T, llvm::Value *metadata,
   }
 
   // Collect the stored properties of the type.
-  unsigned numFields = getNumFields(target);
+  unsigned numFields = countExportableFields(IGM, target);
 
   // Fill out an array with the field type metadata records.
   Address fields = createAlloca(
@@ -3020,6 +3164,9 @@ emitInitializeFieldOffsetVector(SILType T, llvm::Value *metadata,
   forEachField(IGM, target, [&](Field field) {
     assert(field.isConcrete() &&
            "initializing offset vector for type with missing member?");
+    if (!isExportableField(field))
+      return;
+
     SILType propTy = field.getType(IGM, T);
     llvm::Value *fieldLayout = emitTypeLayoutRef(*this, propTy, collector);
     Address fieldLayoutAddr =
@@ -3127,7 +3274,7 @@ static void emitInitializeFieldOffsetVectorWithLayoutString(
       emitAddressOfFieldOffsetVector(IGF, metadata, target).getAddress();
 
   // Collect the stored properties of the type.
-  unsigned numFields = getNumFields(target);
+  unsigned numFields = countExportableFields(IGM, target);
 
   // Ask the runtime to lay out the struct or class.
   auto numFieldsV = IGM.getSize(Size(numFields));
@@ -3150,6 +3297,9 @@ static void emitInitializeFieldOffsetVectorWithLayoutString(
   forEachField(IGM, target, [&](Field field) {
     assert(field.isConcrete() &&
            "initializing offset vector for type with missing member?");
+    if (!isExportableField(field))
+      return;
+
     SILType propTy = field.getType(IGM, T);
     llvm::Value *fieldMetatype;
     llvm::Value *fieldTag;
@@ -4449,16 +4599,26 @@ namespace {
       if (entry) {
         if (entry->getImplementation()->isAsync()) {
           ptr = IGM.getAddrOfAsyncFunctionPointer(entry->getImplementation());
+        } else if (entry->getImplementation()
+                       ->getLoweredFunctionType()
+                       ->isCalleeAllocatedCoroutine()) {
+          ptr = IGM.getAddrOfCoroFunctionPointer(entry->getImplementation());
         } else {
           ptr = IGM.getAddrOfSILFunction(entry->getImplementation(),
                                          NotForDefinition);
         }
       } else {
+        auto *accessor = dyn_cast<AccessorDecl>(afd);
         // The method is removed by dead method elimination.
         // It should be never called. We add a pointer to an error function.
         if (afd->hasAsync()) {
           ptr = llvm::ConstantExpr::getBitCast(
               IGM.getDeletedAsyncMethodErrorAsyncFunctionPointer(),
+              IGM.FunctionPtrTy);
+        } else if (accessor && requiresFeatureCoroutineAccessors(
+                                   accessor->getAccessorKind())) {
+          ptr = llvm::ConstantExpr::getBitCast(
+              IGM.getDeletedCalleeAllocatedCoroutineMethodErrorCoroFunctionPointer(),
               IGM.FunctionPtrTy);
         } else {
           ptr = llvm::ConstantExpr::getBitCast(IGM.getDeletedMethodErrorFn(),
@@ -4471,9 +4631,13 @@ namespace {
         VTableEntriesForVFE.push_back(std::pair<Size, SILDeclRef>(offset, fn));
       }
 
+      auto *accessor = dyn_cast<AccessorDecl>(afd);
       PointerAuthSchema schema =
           afd->hasAsync() ? IGM.getOptions().PointerAuth.AsyncSwiftClassMethods
-                          : IGM.getOptions().PointerAuth.SwiftClassMethods;
+          : accessor &&
+                  requiresFeatureCoroutineAccessors(accessor->getAccessorKind())
+              ? IGM.getOptions().PointerAuth.CoroSwiftClassMethods
+              : IGM.getOptions().PointerAuth.SwiftClassMethods;
       B.addSignedPointer(ptr, schema, fn);
     }
 
@@ -5193,9 +5357,8 @@ diagnoseUnsupportedObjCImplLayout(IRGenModule &IGM, ClassDecl *classDecl,
         diags.diagnose(
             field.getVarDecl(),
             diag::attr_objc_implementation_resilient_property_deployment_target,
-            ctx.getTargetPlatformStringForDiagnostics(),
-            currentAvailability.getRawMinimumVersion(),
-            requiredAvailability.getRawMinimumVersion());
+            ctx.getTargetAvailabilityDomain(), currentAvailability,
+            requiredAvailability);
       else
         diags.diagnose(
             field.getVarDecl(),
@@ -5851,12 +6014,14 @@ namespace {
       if (!layoutStringsEnabled(IGM)) {
         return false;
       }
-      return !!getLayoutString() ||
-             (IGM.Context.LangOpts.hasFeature(
-                 Feature::LayoutStringValueWitnessesInstantiation) &&
-              IGM.getOptions().EnableLayoutStringValueWitnessesInstantiation &&
-                    (HasDependentVWT || HasDependentMetadata) &&
-                      !isa<FixedTypeInfo>(IGM.getTypeInfo(getLoweredType())));
+      const auto &TI = IGM.getTypeInfo(getLoweredType());
+      return (!!getLayoutString() ||
+              (IGM.Context.LangOpts.hasFeature(
+                   Feature::LayoutStringValueWitnessesInstantiation) &&
+               IGM.getOptions().EnableLayoutStringValueWitnessesInstantiation &&
+               (HasDependentVWT || HasDependentMetadata) &&
+               !isa<FixedTypeInfo>(TI))) &&
+             TI.isCopyable(ResilienceExpansion::Maximal);
     }
 
     llvm::Constant *emitNominalTypeDescriptor() {
@@ -6384,13 +6549,15 @@ namespace {
       if (!layoutStringsEnabled(IGM)) {
         return false;
       }
+      auto &TI = IGM.getTypeInfo(getLoweredType());
 
-      return !!getLayoutString() ||
-             (IGM.Context.LangOpts.hasFeature(
-                  Feature::LayoutStringValueWitnessesInstantiation) &&
-              IGM.getOptions().EnableLayoutStringValueWitnessesInstantiation &&
-              (HasDependentVWT || HasDependentMetadata) &&
-              !isa<FixedTypeInfo>(IGM.getTypeInfo(getLoweredType())));
+      return (!!getLayoutString() ||
+              (IGM.Context.LangOpts.hasFeature(
+                   Feature::LayoutStringValueWitnessesInstantiation) &&
+               IGM.getOptions().EnableLayoutStringValueWitnessesInstantiation &&
+               (HasDependentVWT || HasDependentMetadata) &&
+               !isa<FixedTypeInfo>(TI))) &&
+             TI.isCopyable(ResilienceExpansion::Maximal);
     }
 
     llvm::Constant *emitNominalTypeDescriptor() {
@@ -6978,6 +7145,7 @@ SpecialProtocol irgen::getSpecialProtocolID(ProtocolDecl *P) {
   case KnownProtocolKind::Executor:
   case KnownProtocolKind::SerialExecutor:
   case KnownProtocolKind::TaskExecutor:
+  case KnownProtocolKind::ExecutorFactory:
   case KnownProtocolKind::Sendable:
   case KnownProtocolKind::UnsafeSendable:
   case KnownProtocolKind::RangeReplaceableCollection:
@@ -6985,6 +7153,7 @@ SpecialProtocol irgen::getSpecialProtocolID(ProtocolDecl *P) {
   case KnownProtocolKind::Copyable:
   case KnownProtocolKind::Escapable:
   case KnownProtocolKind::BitwiseCopyable:
+  case KnownProtocolKind::SendableMetatype:
     return SpecialProtocol::None;
   }
 
@@ -7201,8 +7370,7 @@ GenericArgumentMetadata irgen::addGenericRequirements(
     case RequirementKind::Layout:
       ++metadata.NumRequirements;
 
-      switch (auto layoutKind =
-                requirement.getLayoutConstraint()->getKind()) {
+      switch (requirement.getLayoutConstraint()->getKind()) {
       case LayoutConstraintKind::Class: {
         // Encode the class constraint.
         auto flags = GenericRequirementFlags(abiKind,
@@ -7486,6 +7654,19 @@ llvm::GlobalValue *irgen::emitAsyncFunctionPointer(IRGenModule &IGM,
       entity, builder.finishAndCreateFuture()));
 }
 
+llvm::GlobalValue *irgen::emitCoroFunctionPointer(IRGenModule &IGM,
+                                                  llvm::Function *function,
+                                                  LinkEntity entity,
+                                                  Size size) {
+  ConstantInitBuilder initBuilder(IGM);
+  ConstantStructBuilder builder(
+      initBuilder.beginStruct(IGM.CoroFunctionPointerTy));
+  builder.addCompactFunctionReference(function);
+  builder.addInt32(size.getValue());
+  return cast<llvm::GlobalValue>(
+      IGM.defineCoroFunctionPointer(entity, builder.finishAndCreateFuture()));
+}
+
 static FormalLinkage getExistentialShapeLinkage(CanGenericSignature genSig,
                                                 CanType shapeType) {
   auto typeLinkage = getTypeLinkage(shapeType);
@@ -7675,8 +7856,10 @@ irgen::emitExtendedExistentialTypeShape(IRGenModule &IGM,
 
     // You can have a superclass with a generic parameter pack in a composition,
     // like `C<each T> & P<Int>`
-    assert(genHeader->GenericPackArguments.empty() &&
+    if (genSig) {
+      assert(genHeader->GenericPackArguments.empty() &&
            "Generic parameter packs not supported here yet");
+    }
 
     return b.finishAndCreateFuture();
   }, [&](llvm::GlobalVariable *var) {

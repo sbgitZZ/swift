@@ -94,7 +94,7 @@ TypeDecl *ASTBuilder::createTypeDecl(NodePointer node) {
     if (proto == nullptr)
       return nullptr;
 
-    auto name = Ctx.getIdentifier(node->getChild(1)->getText());
+    auto name = getIdentifier(node->getChild(1)->getText());
     return proto->getAssociatedType(name);
   }
 
@@ -110,10 +110,9 @@ ASTBuilder::createBuiltinType(StringRef builtinName,
 
     StringRef strippedName =
         builtinName.drop_front(BUILTIN_TYPE_NAME_PREFIX.size());
-    Ctx.TheBuiltinModule->lookupValue(Ctx.getIdentifier(strippedName),
-                                      NLKind::QualifiedLookup,
-                                      decls);
-    
+    Ctx.TheBuiltinModule->lookupValue(getIdentifier(strippedName),
+                                      NLKind::QualifiedLookup, decls);
+
     if (decls.size() == 1 && isa<TypeDecl>(decls[0]))
       return cast<TypeDecl>(decls[0])->getDeclaredInterfaceType();
   }
@@ -155,7 +154,7 @@ Type ASTBuilder::createNominalType(GenericTypeDecl *decl, Type parent) {
     return Type();
 
   // If the declaration is generic, fail.
-  if (auto list = nominalDecl->getGenericParams())
+  if (nominalDecl->isGeneric())
     return Type();
 
   // Imported types can be renamed to be members of other (non-generic)
@@ -348,7 +347,7 @@ Type ASTBuilder::createTupleType(ArrayRef<Type> eltTypes, ArrayRef<StringRef> la
   for (unsigned i : indices(eltTypes)) {
     Identifier label;
     if (!labels[i].empty())
-      label = Ctx.getIdentifier(labels[i]);
+      label = getIdentifier(labels[i]);
     elements.emplace_back(eltTypes[i], label);
   }
 
@@ -408,7 +407,7 @@ Type ASTBuilder::createFunctionType(
     if (!type->isMaterializable())
       return Type();
 
-    auto label = Ctx.getIdentifier(param.getLabel());
+    auto label = getIdentifier(param.getLabel());
     auto flags = param.getFlags();
     auto ownership =
       ParamDecl::getParameterSpecifierForValueOwnership(asValueOwnership(flags.getOwnership()));
@@ -460,6 +459,8 @@ Type ASTBuilder::createFunctionType(
     isolation = FunctionTypeIsolation::forGlobalActor(globalActor);
   } else if (extFlags.isIsolatedAny()) {
     isolation = FunctionTypeIsolation::forErased();
+  } else if (extFlags.isNonIsolatedCaller()) {
+    isolation = FunctionTypeIsolation::forNonIsolatedCaller();
   }
 
   auto noescape =
@@ -525,6 +526,16 @@ getParameterOptions(ImplParameterInfoOptions implOptions) {
   if (implOptions.contains(ImplParameterInfoFlags::Sending)) {
     implOptions -= ImplParameterInfoFlags::Sending;
     result |= SILParameterInfo::Sending;
+  }
+
+  if (implOptions.contains(ImplParameterInfoFlags::Isolated)) {
+    implOptions -= ImplParameterInfoFlags::Isolated;
+    result |= SILParameterInfo::Isolated;
+  }
+
+  if (implOptions.contains(ImplParameterInfoFlags::ImplicitLeading)) {
+    implOptions -= ImplParameterInfoFlags::ImplicitLeading;
+    result |= SILParameterInfo::ImplicitLeading;
   }
 
   // If we did not handle all flags in implOptions, this code was not updated
@@ -646,9 +657,9 @@ Type ASTBuilder::createImplFunctionType(
   #undef SIMPLE_CASE
   }
 
-  auto isolation = SILFunctionTypeIsolation::Unknown;
+  auto isolation = SILFunctionTypeIsolation::forUnknown();
   if (flags.hasErasedIsolation())
-    isolation = SILFunctionTypeIsolation::Erased;
+    isolation = SILFunctionTypeIsolation::forErased();
 
   // There's no representation of this in the mangling because it can't
   // occur in well-formed programs.
@@ -677,6 +688,10 @@ Type ASTBuilder::createImplFunctionType(
     auto type = result.getType()->getCanonicalType();
     auto conv = getResultConvention(result.getConvention());
     auto options = *getResultOptions(result.getOptions());
+    // We currently set sending result at the function level, but we set sending
+    // result on each result.
+    if (flags.hasSendingResult())
+      options |= SILResultInfo::IsSending;
     funcResults.emplace_back(type, conv, options);
   }
 
@@ -762,65 +777,88 @@ Type ASTBuilder::createExistentialMetatypeType(
 Type ASTBuilder::createConstrainedExistentialType(
     Type base, ArrayRef<BuiltRequirement> constraints,
     ArrayRef<BuiltInverseRequirement> inverseRequirements) {
-  Type constrainedBase;
+  llvm::SmallDenseMap<AssociatedTypeDecl *, Type> primaryAssociatedTypes;
+  llvm::SmallDenseSet<AssociatedTypeDecl *> claimed;
 
-  if (auto baseTy = base->getAs<ProtocolType>()) {
-    auto baseDecl = baseTy->getDecl();
-    llvm::SmallDenseMap<Identifier, Type> cmap;
-    for (const auto &req : constraints) {
-      switch (req.getKind()) {
-      case RequirementKind::SameShape:
-        llvm_unreachable("Same-shape requirement not supported here");
-      case RequirementKind::Conformance:
-      case RequirementKind::Superclass:
-      case RequirementKind::Layout:
-        continue;
+  for (const auto &req : constraints) {
+    switch (req.getKind()) {
+    case RequirementKind::SameShape:
+    case RequirementKind::Conformance:
+    case RequirementKind::Superclass:
+    case RequirementKind::Layout:
+      break;
 
-      case RequirementKind::SameType:
-        if (auto *DMT = req.getFirstType()->getAs<DependentMemberType>())
-          cmap[DMT->getName()] = req.getSecondType();
+    case RequirementKind::SameType: {
+      if (auto *memberTy = req.getFirstType()->getAs<DependentMemberType>()) {
+        if (memberTy->getBase()->is<GenericTypeParamType>()) {
+          // This is the only case we understand so far.
+          primaryAssociatedTypes[memberTy->getAssocType()] = req.getSecondType();
+          continue;
+        }
       }
+      break;
     }
+    }
+
+    // If we end here, we didn't recognize this requirement.
+    return Type();
+  }
+
+  auto maybeFormParameterizedProtocolType = [&](ProtocolType *protoTy) -> Type {
+    auto *proto = protoTy->getDecl();
+
     llvm::SmallVector<Type, 4> args;
-    for (auto *assocTy : baseDecl->getPrimaryAssociatedTypes()) {
-      auto argTy = cmap.find(assocTy->getName());
-      if (argTy == cmap.end()) {
-        return Type();
-      }
-      args.push_back(argTy->getSecond());
+    for (auto *assocTy : proto->getPrimaryAssociatedTypes()) {
+      auto found = primaryAssociatedTypes.find(assocTy);
+      if (found == primaryAssociatedTypes.end())
+        return protoTy;
+      args.push_back(found->second);
+      claimed.insert(found->first);
     }
 
     // We may not have any arguments because the constrained existential is a
     // plain protocol with an inverse requirement.
-    if (args.empty()) {
-      constrainedBase =
-          ProtocolType::get(baseDecl, baseTy, base->getASTContext());
-    } else {
-      constrainedBase =
-          ParameterizedProtocolType::get(base->getASTContext(), baseTy, args);
-    }
-  } else if (base->isAny()) {
-    // The only other case should be that we got an empty PCT, which is equal to
-    // the Any type. The other constraints should have been encoded in the
-    // existential's generic signature (and arrive as BuiltInverseRequirement).
-    constrainedBase = base;
+    if (args.empty())
+      return protoTy;
+
+    return ParameterizedProtocolType::get(Ctx, protoTy, args);
+  };
+
+  SmallVector<Type, 2> members;
+  bool hasExplicitAnyObject = false;
+  InvertibleProtocolSet inverses;
+
+  // We're given either a single protocol type, or a composition of protocol
+  // types. Transform each protocol type to add arguments, if necessary.
+  if (auto protoTy = base->getAs<ProtocolType>()) {
+    members.push_back(maybeFormParameterizedProtocolType(protoTy));
   } else {
-    return Type();
+    auto compositionTy = base->castTo<ProtocolCompositionType>();
+    hasExplicitAnyObject = compositionTy->hasExplicitAnyObject();
+    ASSERT(compositionTy->getInverses().empty());
+
+    for (auto member : compositionTy->getMembers()) {
+      if (auto *protoTy = member->getAs<ProtocolType>()) {
+        members.push_back(maybeFormParameterizedProtocolType(protoTy));
+        continue;
+      }
+      ASSERT(member->getClassOrBoundGenericClass());
+      members.push_back(member);
+    }
   }
 
-  assert(constrainedBase);
+  // Make sure that all arguments were actually used.
+  ASSERT(claimed.size() == primaryAssociatedTypes.size());
 
   // Handle inverse requirements.
   if (!inverseRequirements.empty()) {
-    InvertibleProtocolSet inverseSet;
     for (const auto &inverseReq : inverseRequirements) {
-      inverseSet.insert(inverseReq.getKind());
+      inverses.insert(inverseReq.getKind());
     }
-    constrainedBase = ProtocolCompositionType::get(
-        Ctx, { constrainedBase }, inverseSet, /*hasExplicitAnyObject=*/false);
   }
 
-  return ExistentialType::get(constrainedBase);
+  return ExistentialType::get(ProtocolCompositionType::get(
+      Ctx, members, inverses, hasExplicitAnyObject));
 }
 
 Type ASTBuilder::createSymbolicExtendedExistentialType(NodePointer shapeNode,
@@ -878,7 +916,7 @@ Type ASTBuilder::createGenericTypeParameterType(unsigned depth,
 
 Type ASTBuilder::createDependentMemberType(StringRef member,
                                            Type base) {
-  auto identifier = Ctx.getIdentifier(member);
+  auto identifier = getIdentifier(member);
 
   if (auto *archetype = base->getAs<ArchetypeType>()) {
       if (Type memberType = archetype->getNestedTypeByName(identifier))
@@ -895,7 +933,7 @@ Type ASTBuilder::createDependentMemberType(StringRef member,
 Type ASTBuilder::createDependentMemberType(StringRef member,
                                            Type base,
                                            ProtocolDecl *protocol) {
-  auto identifier = Ctx.getIdentifier(member);
+  auto identifier = getIdentifier(member);
 
   if (auto *archetype = base->getAs<ArchetypeType>()) {
     if (auto assocType = protocol->getAssociatedType(identifier))
@@ -1049,6 +1087,10 @@ Type ASTBuilder::createArrayType(Type base) {
   return ArraySliceType::get(base);
 }
 
+Type ASTBuilder::createInlineArrayType(Type count, Type element) {
+  return InlineArrayType::get(count, element);
+}
+
 Type ASTBuilder::createDictionaryType(Type key, Type value) {
   return DictionaryType::get(key, value);
 }
@@ -1135,7 +1177,7 @@ ASTBuilder::getAcceptableTypeDeclCandidate(ValueDecl *decl,
 
 DeclContext *ASTBuilder::getNotionalDC() {
   if (!NotionalDC) {
-    NotionalDC = ModuleDecl::createEmpty(Ctx.getIdentifier(".RemoteAST"), Ctx);
+    NotionalDC = ModuleDecl::createEmpty(getIdentifier(".RemoteAST"), Ctx);
     NotionalDC = new (Ctx) TopLevelCodeDecl(NotionalDC);
   }
   return NotionalDC;
@@ -1308,7 +1350,7 @@ ASTBuilder::findDeclContext(NodePointer node) {
                  Demangle::Node::Kind::PrivateDeclName) {
       name = declNameNode->getChild(1)->getText();
       privateDiscriminator =
-        Ctx.getIdentifier(declNameNode->getChild(0)->getText());
+          getIdentifier(declNameNode->getChild(0)->getText());
 
     } else if (declNameNode->getKind() ==
                  Demangle::Node::Kind::RelatedEntityDeclName) {
@@ -1336,14 +1378,14 @@ ASTBuilder::findDeclContext(NodePointer node) {
         return nullptr;
 
       for (auto *module : potentialModules)
-        if (auto typeDecl = findTypeDecl(module, Ctx.getIdentifier(name),
+        if (auto typeDecl = findTypeDecl(module, getIdentifier(name),
                                          privateDiscriminator, node->getKind()))
           return typeDecl;
       return nullptr;
     }
 
     if (auto *dc = findDeclContext(child))
-      if (auto typeDecl = findTypeDecl(dc, Ctx.getIdentifier(name),
+      if (auto typeDecl = findTypeDecl(dc, getIdentifier(name),
                                        privateDiscriminator, node->getKind()))
         return typeDecl;
 
@@ -1542,7 +1584,7 @@ GenericTypeDecl *ASTBuilder::findForeignTypeDecl(StringRef name,
                                     found);
       break;
     }
-    importer->lookupValue(Ctx.getIdentifier(name), consumer);
+    importer->lookupValue(getIdentifier(name), consumer);
     if (consumer.Result)
       consumer.Result = getAcceptableTypeDeclCandidate(consumer.Result, kind);
     break;
@@ -1551,4 +1593,29 @@ GenericTypeDecl *ASTBuilder::findForeignTypeDecl(StringRef name,
   }
 
   return consumer.Result;
+}
+
+Identifier ASTBuilder::getIdentifier(StringRef name) {
+  if (name.size() > 1 && name.front() == '`' && name.back() == '`') {
+    // Raw identifiers have backticks affixed before mangling. We need to
+    // remove those before creating the Identifier for the AST, which doesn't
+    // encode the backticks.
+    std::string fixedName;
+    for (size_t i = 1; i < name.size() - 1; ++i) {
+      unsigned char ch = name[i];
+      // Raw identifiers have the space (U+0020) replaced with a non-breaking
+      // space (U+00A0, UTF-8: 0xC2 0xA0) in their mangling so that parts of
+      // the runtime that use space as a delimiter remain compatible with
+      // these identifiers. Flip it back.
+      if (ch == 0xc2 && i < name.size() - 2 &&
+          (unsigned char)name[i + 1] == 0xa0) {
+        fixedName.push_back(' ');
+        ++i;
+      } else {
+        fixedName.push_back(ch);
+      }
+    }
+    return Ctx.getIdentifier(fixedName);
+  }
+  return Ctx.getIdentifier(name);
 }

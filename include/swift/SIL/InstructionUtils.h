@@ -129,6 +129,11 @@ bool isEndOfScopeMarker(SILInstruction *user);
 /// only used in recognizable patterns without otherwise "escaping".
 bool isIncidentalUse(SILInstruction *user);
 
+/// Returns true if this is a move only wrapper use.
+///
+/// E.x.: moveonlywrapper_to_copyable_addr, copyable_to_moveonlywrapper_value
+bool isMoveOnlyWrapperUse(SILInstruction *user);
+
 /// Return true if the given `user` instruction modifies the value's refcount
 /// without propagating the value or having any other effect aside from
 /// potentially destroying the value itself (and executing associated cleanups).
@@ -241,6 +246,13 @@ lookUpFunctionInWitnessTable(WitnessMethodInst *wmi, SILModule::LinkingMode link
 /// False if expanding a type is invalid. For example, expanding a
 /// struct-with-deinit drops the deinit.
 bool shouldExpand(SILModule &module, SILType ty);
+
+/// Returns true if `arg` is mutated.
+/// if `ignoreDestroys` is true, `destroy_addr` instructions are ignored.
+/// `defaultIsMutating` specifies the state of instructions which are not explicitly handled.
+/// For historical reasons this utility is implemented in SILVerifier.cpp.
+bool isIndirectArgumentMutated(SILFunctionArgument *arg, bool ignoreDestroys = false,
+                               bool defaultIsMutating = false);
 
 } // end namespace swift
 

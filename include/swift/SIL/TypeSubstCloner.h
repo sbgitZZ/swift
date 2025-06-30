@@ -247,13 +247,16 @@ protected:
     if (canSILUseScalarCheckedCastInstructions(B.getModule(),
                                                sourceType, targetType)) {
       emitIndirectConditionalCastWithScalar(
-          B, SwiftMod, loc, inst->getConsumptionKind(), src, sourceType, dest,
+          B, SwiftMod, loc, inst->getCheckedCastOptions(),
+          inst->getConsumptionKind(), src, sourceType, dest,
           targetType, succBB, failBB, TrueCount, FalseCount);
       return;
     }
 
     // Otherwise, use the indirect cast.
-    B.createCheckedCastAddrBranch(loc, inst->getConsumptionKind(),
+    B.createCheckedCastAddrBranch(loc,
+                                  inst->getCheckedCastOptions(),
+                                  inst->getConsumptionKind(),
                                   src, sourceType,
                                   dest, targetType,
                                   succBB, failBB);
@@ -281,6 +284,16 @@ protected:
     super::visitCopyValueInst(Copy);
   }
 
+  void visitExplicitCopyValueInst(ExplicitCopyValueInst *Copy) {
+    // If the substituted type is trivial, ignore the copy.
+    SILType copyTy = getOpType(Copy->getType());
+    if (copyTy.isTrivial(*Copy->getFunction())) {
+      recordFoldedValue(SILValue(Copy), getOpValue(Copy->getOperand()));
+      return;
+    }
+    super::visitExplicitCopyValueInst(Copy);
+  }
+
   void visitDestroyValueInst(DestroyValueInst *Destroy) {
     // If the substituted type is trivial, ignore the destroy.
     SILType destroyTy = getOpType(Destroy->getOperand()->getType());
@@ -288,6 +301,24 @@ protected:
       return;
     }
     super::visitDestroyValueInst(Destroy);
+  }
+
+  void visitEndLifetimeInst(EndLifetimeInst *endLifetime) {
+    // If the substituted type is trivial, ignore the end_lifetime.
+    SILType ty = getOpType(endLifetime->getOperand()->getType());
+    if (ty.isTrivial(*endLifetime->getFunction())) {
+      return;
+    }
+    super::visitEndLifetimeInst(endLifetime);
+  }
+
+  void visitExtendLifetimeInst(ExtendLifetimeInst *extendLifetime) {
+    // If the substituted type is trivial, ignore the extend_lifetime.
+    SILType ty = getOpType(extendLifetime->getOperand()->getType());
+    if (ty.isTrivial(*extendLifetime->getFunction())) {
+      return;
+    }
+    super::visitExtendLifetimeInst(extendLifetime);
   }
 
   void visitDifferentiableFunctionExtractInst(

@@ -414,6 +414,15 @@ private:
 
   std::vector<std::unique_ptr<const GenericSignatureRef>> SignatureRefPool;
 
+  /// This builder doesn't perform "on the fly" substitutions, so we preserve
+  /// all pack expansions. We still need an active expansion stack though,
+  /// for the dummy implementation of these methods:
+  /// - beginPackExpansion()
+  /// - advancePackExpansion()
+  /// - createExpandedPackElement()
+  /// - endPackExpansion()
+  std::vector<const TypeRef *> ActivePackExpansions;
+
   TypeConverter TC;
 
 #define TYPEREF(Id, Parent) \
@@ -917,6 +926,12 @@ public:
     return nullptr;
   }
 
+  const TypeRef *createInlineArrayType(const TypeRef *count,
+                                       const TypeRef *element) {
+    // TypeRefs don't contain sugared types
+    return nullptr;
+  }
+
   const TypeRef *createDictionaryType(const TypeRef *key,
                                       const TypeRef *value) {
     // TypeRefs don't contain sugared types
@@ -929,19 +944,16 @@ public:
   }
 
   const TypeRef *createIntegerType(intptr_t value) {
-    // FIXME: implement
-    return nullptr;
+    return IntegerTypeRef::create(*this, value);
   }
 
   const TypeRef *createNegativeIntegerType(intptr_t value) {
-    // FIXME: implement
-    return nullptr;
+    return IntegerTypeRef::create(*this, value);
   }
 
   const TypeRef *createBuiltinFixedArrayType(const TypeRef *size,
                                              const TypeRef *element) {
-    // FIXME: implement
-    return nullptr;
+    return BuiltinFixedArrayTypeRef::create(*this, size, element);
   }
 
   // Construct a bound generic type ref along with the parent type info
@@ -1130,8 +1142,7 @@ public:
   }
 
   const TypeRef *createPackType(llvm::ArrayRef<const TypeRef *> elements) {
-    // FIXME: Remote mirrors support for variadic generics.
-    return nullptr;
+    return PackTypeRef::create(*this, elements);
   }
 
   const TypeRef *createSILPackType(llvm::ArrayRef<const TypeRef *> elements,
@@ -1141,21 +1152,22 @@ public:
   }
 
   size_t beginPackExpansion(const TypeRef *countType) {
-    // FIXME: Remote mirrors support for variadic generics.
-    return 0;
+    ActivePackExpansions.push_back(countType);
+    return 1;
   }
 
   void advancePackExpansion(size_t index) {
-    // FIXME: Remote mirrors support for variadic generics.
+    assert(index == 0);
   }
 
   const TypeRef *createExpandedPackElement(const TypeRef *patternType) {
-    // FIXME: Remote mirrors support for variadic generics.
-    return nullptr;
+    assert(!ActivePackExpansions.empty());
+    auto countType = ActivePackExpansions.back();
+    return PackExpansionTypeRef::create(*this, patternType, countType);
   }
 
   void endPackExpansion() {
-    // FIXME: Remote mirrors support for variadic generics.
+    ActivePackExpansions.pop_back();
   }
 
   const FunctionTypeRef *createFunctionType(
@@ -1859,7 +1871,7 @@ private:
         if (auto symbol = OpaquePointerReader(
                 remote::RemoteAddress(adjustedProtocolDescriptorTarget),
                 PointerSize)) {
-          if (!symbol->getSymbol().empty()) {
+          if (!symbol->getSymbol().empty() && symbol->getOffset() == 0) {
             Demangle::Context Ctx;
             auto demangledRoot =
                 Ctx.demangleSymbolAsNode(symbol->getSymbol().str());
@@ -1870,7 +1882,8 @@ private:
                 nodeToString(demangledRoot->getChild(0)->getChild(0));
           } else {
             // This is an absolute address of a protocol descriptor
-            auto protocolDescriptorAddress = (uintptr_t)symbol->getOffset();
+            auto protocolDescriptorAddress =
+                (uintptr_t)symbol->getResolvedAddress().getAddressData();
             protocolName = readFullyQualifiedProtocolNameFromProtocolDescriptor(
                 protocolDescriptorAddress);
           }
@@ -2014,7 +2027,7 @@ private:
         if (auto symbol = OpaquePointerReader(
                 remote::RemoteAddress(adjustedParentTargetAddress),
                 PointerSize)) {
-          if (!symbol->getSymbol().empty()) {
+          if (!symbol->getSymbol().empty() && symbol->getOffset() == 0) {
             Demangle::Context Ctx;
             auto demangledRoot =
                 Ctx.demangleSymbolAsNode(symbol->getSymbol().str());
@@ -2252,7 +2265,7 @@ private:
       // external, check that first
       if (auto symbol = OpaqueDynamicSymbolResolver(
               remote::RemoteAddress(contextTypeDescriptorAddress))) {
-        if (!symbol->isResolved()) {
+        if (!symbol->getSymbol().empty() && symbol->getOffset() == 0) {
           Demangle::Context Ctx;
           auto demangledRoot =
               Ctx.demangleSymbolAsNode(symbol->getSymbol().str());
@@ -2271,10 +2284,11 @@ private:
             mangledTypeName = typeMangling.result();
 
           return std::make_pair(mangledTypeName, typeName);
-        } else if (symbol->getOffset()) {
+        } else if (symbol->getResolvedAddress()) {
           // If symbol is empty and has an offset, this is the resolved remote
           // address
-          contextTypeDescriptorAddress = symbol->getOffset();
+          contextTypeDescriptorAddress =
+              symbol->getResolvedAddress().getAddressData();
         }
       }
 

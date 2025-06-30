@@ -52,6 +52,15 @@ extension AnyPath {
       a
     }
   }
+
+  public func absolute(in base: AbsolutePath) -> AbsolutePath {
+    switch self {
+    case .relative(let r):
+      r.absolute(in: base)
+    case .absolute(let a):
+      a
+    }
+  }
 }
 
 extension AnyPath: Decodable {
@@ -63,11 +72,5 @@ extension AnyPath: Decodable {
 extension AnyPath: ExpressibleByArgument {
   public init(argument rawPath: String) {
     self.init(rawPath)
-  }
-}
-
-extension StringProtocol {
-  func hasExtension(_ ext: FileExtension) -> Bool {
-    FilePath(String(self)).extension == ext.rawValue
   }
 }

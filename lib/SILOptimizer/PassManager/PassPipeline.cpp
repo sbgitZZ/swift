@@ -117,15 +117,18 @@ static void addMandatoryDiagnosticOptPipeline(SILPassPipelinePlan &P) {
   // This guarantees that stack-promotable boxes have [static] enforcement.
   P.addAccessEnforcementSelection();
 
-  P.addAllocBoxToStack();
+#ifdef SWIFT_ENABLE_SWIFT_IN_SWIFT
+  P.addMandatoryAllocBoxToStack();
+#else
+  P.addLegacyAllocBoxToStack();
+#endif
   P.addNoReturnFolding();
   P.addBooleanLiteralFolding();
   addDefiniteInitialization(P);
 
   P.addAddressLowering();
 
-  // Before we run later semantic optimizations, eliminate simple functions that
-  // we specialized to ensure that we do not emit diagnostics twice.
+  // TODO: remove this once CapturePromotion deletes specialized functions itself.
   P.addDiagnosticDeadFunctionElimination();
 
   P.addFlowIsolation();
@@ -151,13 +154,6 @@ static void addMandatoryDiagnosticOptPipeline(SILPassPipelinePlan &P) {
   // and `differentiable_function` instructions.
   P.addDifferentiation();
 
-  // Only run semantic arc opts if we are optimizing and if mandatory semantic
-  // arc opts is explicitly enabled.
-  //
-  // NOTE: Eventually this pass will be split into a mandatory/more aggressive
-  // pass. This will happen when OSSA is no longer eliminated before the
-  // optimizer pipeline is run implying we can put a pass that requires OSSA
-  // there.
   const auto &Options = P.getOptions();
   P.addClosureLifetimeFixup();
 
@@ -213,7 +209,7 @@ static void addMandatoryDiagnosticOptPipeline(SILPassPipelinePlan &P) {
 
   // Promote loads as necessary to ensure we have enough SSA formation to emit
   // SSA based diagnostics.
-  P.addPredictableMemoryAccessOptimizations();
+  P.addMandatoryRedundantLoadElimination();
 
   // This phase performs optimizations necessary for correct interoperation of
   // Swift os log APIs with C os_log ABIs.
@@ -257,7 +253,6 @@ static void addMandatoryDiagnosticOptPipeline(SILPassPipelinePlan &P) {
 
   P.addMandatoryPerformanceOptimizations();
   P.addOnoneSimplification();
-  P.addAllocVectorLowering();
   P.addInitializeStaticGlobals();
 
   // MandatoryPerformanceOptimizations might create specializations that are not
@@ -270,6 +265,8 @@ static void addMandatoryDiagnosticOptPipeline(SILPassPipelinePlan &P) {
     P.addDeadFunctionAndGlobalElimination();
   }
 
+  P.addDiagnoseUnknownConstValues();
+  P.addEmbeddedSwiftDiagnostics();
   P.addPerformanceDiagnostics();
 }
 
@@ -404,7 +401,7 @@ void addHighLevelLoopOptPasses(SILPassPipelinePlan &P) {
   P.addPerformanceConstantPropagation();
   P.addSimplifyCFG();
   // End of unrolling passes.
-  P.addABCOpt();
+  P.addBoundsCheckOpts();
   // Cleanup.
   P.addDCE();
   P.addCOWArrayOpts();
@@ -437,7 +434,7 @@ void addFunctionPasses(SILPassPipelinePlan &P,
   P.addDCE();
 
   // Optimize copies from a temporary (an "l-value") to a destination.
-  P.addTempLValueOpt();
+  P.addTempLValueElimination();
 
   // Split up opaque operations (copy_addr, retain_value, etc.).
   P.addLowerAggregateInstrs();
@@ -475,7 +472,7 @@ void addFunctionPasses(SILPassPipelinePlan &P,
   if (OpLevel == OptimizationLevelKind::MidLevel) {
     P.addHighLevelLICM();
     P.addArrayCountPropagation();
-    P.addABCOpt();
+    P.addBoundsCheckOpts();
     P.addDCE();
     P.addCOWArrayOpts();
     P.addDCE();
@@ -586,7 +583,7 @@ void addFunctionPasses(SILPassPipelinePlan &P,
   P.addEarlyCodeMotion();
   P.addReleaseHoisting();
   P.addARCSequenceOpts();
-  P.addTempRValueOpt();
+  P.addTempRValueElimination();
 
   P.addSimplifyCFG();
   if (OpLevel == OptimizationLevelKind::LowLevel) {
@@ -642,7 +639,7 @@ static void addPerfEarlyModulePassPipeline(SILPassPipelinePlan &P) {
   P.addDeadFunctionAndGlobalElimination();
 
   // Cleanup after SILGen: remove trivial copies to temporaries.
-  P.addTempRValueOpt();
+  P.addTempRValueElimination();
   // Cleanup after SILGen: remove unneeded borrows/copies.
   if (P.getOptions().CopyPropagation == CopyPropagationOption::On) {
     P.addComputeSideEffects();
@@ -662,7 +659,7 @@ static void addPerfEarlyModulePassPipeline(SILPassPipelinePlan &P) {
   // Cleanup after SILGen: remove trivial copies to temporaries. This version of
   // temp-rvalue opt is here so that we can hit copies from non-ossa code that
   // is linked in from the stdlib.
-  P.addTempRValueOpt();
+  P.addTempRValueElimination();
 
   // Add the outliner pass (Osize).
   P.addOutliner();
@@ -1011,14 +1008,14 @@ SILPassPipelinePlan::getPerformancePassPipeline(const SILOptions &Options) {
   // importing this module.
   P.addSerializeSILPass();
 
+  if (Options.StopOptimizationAfterSerialization)
+    return P;
+
   if (P.getOptions().EnableOSSAModules && SILPrintFinalOSSAModule) {
     addModulePrinterPipeline(P, "SIL Print Final OSSA Module");
   }
   // Strip any transparent functions that still have ownership.
   P.addOwnershipModelEliminator();
-
-  if (Options.StopOptimizationAfterSerialization)
-    return P;
 
   P.addAutodiffClosureSpecialization();
 
@@ -1082,8 +1079,14 @@ SILPassPipelinePlan::getOnonePassPipeline(const SILOptions &Options) {
   P.startPipeline("Serialization");
   P.addSerializeSILPass();
 
+  if (Options.StopOptimizationAfterSerialization)
+    return P;
+
   // Now that we have serialized, propagate debug info.
   P.addMovedAsyncVarDebugInfoPropagator();
+
+  // Even at Onone it's important to remove copies of structs, especially if they are large.
+  P.addMandatoryTempRValueElimination();
 
   // If we are asked to stop optimizing before lowering ownership, do so now.
   if (P.Options.StopOptimizationBeforeLoweringOwnership)

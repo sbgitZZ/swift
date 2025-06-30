@@ -189,10 +189,8 @@ public func usePrespecializedEntryPoints(wrapperStruct: ReferenceWrapperStruct, 
 // OPT:   [[A1:%.*]] = unchecked_ref_cast [[P1]] : $SomeClass to $AnyObject
 // OPT:   [[R3:%.*]] = apply [[F1]]([[A1]]) : $@convention(thin) (@guaranteed AnyObject) -> @owned AnyObject
 // OPT:   store [[R3]] to [[R2]] : $*AnyObject
-// OPT:   [[A2:%.*]] = load [[R1]] : $*SomeClass
 // OPT:   [[F2:%.*]] = function_ref @$s22pre_specialize_layouts7consumeyyxlF0a20_specialized_module_C09SomeClassC_Ttg5 : $@convention(thin) () -> ()
 // OPT:   apply [[F2]]() : $@convention(thin) () -> ()
-// OPT:   strong_release [[A2]] : $SomeClass
 // OPT:   dealloc_stack [[R1]] : $*SomeClass
 // OPT: } // end sil function '$s22pre_specialize_layouts46usePrespecializedEntryPointsWithMarkerProtocol1ty0a20_specialized_module_C09SomeClassC_tF'
 public func usePrespecializedEntryPointsWithMarkerProtocol(t: SomeClass) {

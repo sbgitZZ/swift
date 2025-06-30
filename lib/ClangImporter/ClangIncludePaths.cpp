@@ -197,7 +197,7 @@ ClangImporter::createClangArgs(const ClangImporterOptions &ClangImporterOpts,
 }
 
 static SmallVector<std::pair<std::string, std::string>, 2>
-getLibcFileMapping(ASTContext &ctx, StringRef modulemapFileName,
+getLibcFileMapping(const ASTContext &ctx, StringRef modulemapFileName,
                    std::optional<ArrayRef<StringRef>> maybeHeaderFileNames,
                    const llvm::IntrusiveRefCntPtr<llvm::vfs::FileSystem> &vfs,
                    bool suppressDiagnostic) {
@@ -263,7 +263,7 @@ getLibcFileMapping(ASTContext &ctx, StringRef modulemapFileName,
 }
 
 static void getLibStdCxxFileMapping(
-    ClangInvocationFileMapping &fileMapping, ASTContext &ctx,
+    ClangInvocationFileMapping &fileMapping, const ASTContext &ctx,
     const llvm::IntrusiveRefCntPtr<llvm::vfs::FileSystem> &vfs,
     bool suppressDiagnostic) {
   assert(ctx.LangOpts.EnableCXXInterop &&
@@ -454,7 +454,7 @@ GetPlatformAuxiliaryFile(StringRef Platform, StringRef File,
 }
 
 void GetWindowsFileMappings(
-    ClangInvocationFileMapping &fileMapping, ASTContext &Context,
+    ClangInvocationFileMapping &fileMapping, const ASTContext &Context,
     const llvm::IntrusiveRefCntPtr<llvm::vfs::FileSystem> &driverVFS,
     bool &requiresBuiltinHeadersInSystemModules) {
   const llvm::Triple &Triple = Context.LangOpts.Target;
@@ -560,21 +560,32 @@ void GetWindowsFileMappings(
       fileMapping.redirectedFiles.emplace_back(std::string(VCToolsInjection),
                                                AuxiliaryFile);
 
-    // __msvc_bit_utils.hpp was added in a recent VS 2022 version. It has to be
-    // referenced from the modulemap directly to avoid modularization errors.
-    // Older VS versions might not have it. Let's inject an empty header file if
-    // it isn't available.
-    llvm::sys::path::remove_filename(VCToolsInjection);
-    llvm::sys::path::append(VCToolsInjection, "__msvc_bit_utils.hpp");
-    if (!llvm::sys::fs::exists(VCToolsInjection))
-      fileMapping.overridenFiles.emplace_back(std::string(VCToolsInjection),
-                                              "");
+    // Because we wish to be backwards compatible with older Visual Studio
+    // releases, we inject empty headers which allow us to have definitions for
+    // modules referencing headers which may not exist. We stub out the headers
+    // with empty files to allow a single module definition to work across
+    // different MSVC STL releases.
+    //
+    // __msvc_bit_utils.hpp was introduced in VS 2022 STL release 17.8.
+    // __msvc_string_view.hpp was introduced in VS 2022 STL release 17.11.
+    static const char * const kInjectedHeaders[] = {
+      "__msvc_bit_utils.hpp",
+      "__msvc_string_view.hpp",
+    };
+
+    for (const char * const header : kInjectedHeaders) {
+      llvm::sys::path::remove_filename(VCToolsInjection);
+      llvm::sys::path::append(VCToolsInjection, header);
+      if (!llvm::sys::fs::exists(VCToolsInjection))
+        fileMapping.overridenFiles.emplace_back(std::string{VCToolsInjection},
+                                                "");
+    }
   }
 }
 } // namespace
 
 ClangInvocationFileMapping swift::getClangInvocationFileMapping(
-  ASTContext &ctx, llvm::IntrusiveRefCntPtr<llvm::vfs::FileSystem> vfs,
+  const ASTContext &ctx, llvm::IntrusiveRefCntPtr<llvm::vfs::FileSystem> vfs,
   bool suppressDiagnostic) {
   ClangInvocationFileMapping result;
   if (!vfs)
@@ -643,4 +654,53 @@ ClangInvocationFileMapping swift::getClangInvocationFileMapping(
   GetWindowsFileMappings(result, ctx, vfs,
                          result.requiresBuiltinHeadersInSystemModules);
   return result;
+}
+
+ClangInvocationFileMapping swift::applyClangInvocationMapping(const ASTContext &ctx,
+                                        llvm::IntrusiveRefCntPtr<llvm::vfs::FileSystem> baseVFS,
+                                        llvm::IntrusiveRefCntPtr<llvm::vfs::FileSystem> &fileSystem,
+                                        bool suppressDiagnostics) {
+  if (ctx.CASOpts.HasImmutableFileSystem)
+    return ClangInvocationFileMapping();
+
+  ClangInvocationFileMapping fileMapping =
+    getClangInvocationFileMapping(ctx, baseVFS, suppressDiagnostics);
+
+  auto importerOpts = ctx.ClangImporterOpts;
+  // Wrap Swift's FS to allow Clang to override the working directory
+  fileSystem = llvm::vfs::RedirectingFileSystem::create(
+      fileMapping.redirectedFiles, true, *fileSystem);
+  if (importerOpts.DumpClangDiagnostics) {
+    llvm::errs() << "clang importer redirected file mappings:\n";
+    for (const auto &mapping : fileMapping.redirectedFiles) {
+      llvm::errs() << "   mapping real file '" << mapping.second
+                   << "' to virtual file '" << mapping.first << "'\n";
+    }
+    llvm::errs() << "\n";
+  }
+
+  if (!fileMapping.overridenFiles.empty()) {
+    llvm::IntrusiveRefCntPtr<llvm::vfs::InMemoryFileSystem> overridenVFS =
+        new llvm::vfs::InMemoryFileSystem();
+    for (const auto &file : fileMapping.overridenFiles) {
+      if (importerOpts.DumpClangDiagnostics) {
+        llvm::errs() << "clang importer overriding file '" << file.first
+                     << "' with the following contents:\n";
+        llvm::errs() << file.second << "\n";
+      }
+      auto contents = ctx.Allocate<char>(file.second.size() + 1);
+      std::copy(file.second.begin(), file.second.end(), contents.begin());
+      // null terminate the buffer.
+      contents[contents.size() - 1] = '\0';
+      overridenVFS->addFile(file.first, 0,
+                            llvm::MemoryBuffer::getMemBuffer(StringRef(
+                                contents.begin(), contents.size() - 1)));
+    }
+    llvm::IntrusiveRefCntPtr<llvm::vfs::OverlayFileSystem> overlayVFS =
+        new llvm::vfs::OverlayFileSystem(fileSystem);
+    fileSystem = overlayVFS;
+    overlayVFS->pushOverlay(overridenVFS);
+  }
+
+  return fileMapping;
 }

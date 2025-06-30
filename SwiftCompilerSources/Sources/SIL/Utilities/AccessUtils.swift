@@ -55,6 +55,10 @@ public enum AccessBase : CustomStringConvertible, Hashable {
   case stack(AllocStackInst)
   
   /// The address of a global variable.
+  ///
+  /// TODO: make this payload the global address. Make AccessBase.address non-optional. Make AccessBase comparison see
+  /// though things like project_box and global_addr. Then cleanup APIs like LifetimeDependence.Scope that carry extra
+  /// address values around.
   case global(GlobalVariable)
   
   /// The address of a stored property of a class instance.
@@ -85,6 +89,8 @@ public enum AccessBase : CustomStringConvertible, Hashable {
 
   /// The access base is some SIL pattern which does not fit into any other case.
   /// This should be a very rare situation.
+  ///
+  /// TODO: unidentified should preserve its base address value, but AccessBase must be Hashable.
   case unidentified
 
   public init(baseAddress: Value) {
@@ -114,7 +120,7 @@ public enum AccessBase : CustomStringConvertible, Hashable {
     }
   }
 
-  /// Return 'nil' for global varabiables and unidentified addresses.
+  /// Return 'nil' for global variables and unidentified addresses.
   public var address: Value? {
     switch self {
       case .global, .unidentified: return nil
@@ -214,6 +220,21 @@ public enum AccessBase : CustomStringConvertible, Hashable {
         return true
       case .argument, .yield, .pointer, .index, .unidentified:
         return false
+    }
+  }
+
+  public var storageIsLexical: Bool {
+    switch self {
+    case .argument(let arg):
+      return arg.isLexical
+    case .stack(let allocStack):
+      return allocStack.isLexical
+    case .global:
+      return true
+    case .box, .class, .tail:
+      return reference!.referenceRoot.isLexical
+    case .yield, .pointer, .index, .storeBorrow, .unidentified:
+      return false
     }
   }
 
@@ -410,7 +431,7 @@ public struct AccessPath : CustomStringConvertible, Hashable {
 
 private func canBeOperandOfIndexAddr(_ value: Value) -> Bool {
   switch value {
-  case is IndexAddrInst, is RefTailAddrInst, is PointerToAddressInst:
+  case is IndexAddrInst, is RefTailAddrInst, is PointerToAddressInst, is VectorBaseAddrInst:
     return true
   default:
     return false
@@ -424,7 +445,7 @@ private func canBeOperandOfIndexAddr(_ value: Value) -> Bool {
 /// %ptr = address_to_pointer %orig_addr
 /// %addr = pointer_to_address %ptr
 /// ```
-private extension PointerToAddressInst {
+public extension PointerToAddressInst {
   var originatingAddress: Value? {
 
     struct Walker : ValueUseDefWalker {
@@ -477,7 +498,34 @@ private extension PointerToAddressInst {
   }
 }
 
-/// The `EnclosingScope` of an access is the innermost `begin_access`
+/// TODO: migrate AccessBase to use this instead of GlobalVariable because many utilities need to get back to a
+/// representative SIL Value.
+public enum GlobalAccessBase {
+  case global(GlobalAddrInst)
+  case initializer(PointerToAddressInst)
+
+  public init?(address: Value) {
+    switch address {
+    case let ga as GlobalAddrInst:
+      self = .global(ga)
+    case let p2a as PointerToAddressInst where p2a.resultOfGlobalAddressorCall != nil:
+      self = .initializer(p2a)
+    default:
+      return nil
+    }
+  }
+
+  public var address: Value {
+    switch self {
+      case let .global(ga):
+        return ga
+      case let .initializer(p2a):
+        return p2a
+    }
+  }
+}
+
+/// The `EnclosingAccessScope` of an access is the innermost `begin_access`
 /// instruction that checks for exclusivity of the access.
 /// If there is no `begin_access` instruction found, then the scope is
 /// the base itself.
@@ -497,13 +545,90 @@ private extension PointerToAddressInst {
 /// %l3 = load %a3 : $*Int64
 /// end_access %a3 : $*Int64
 /// ```
-public enum EnclosingScope {
-  case scope(BeginAccessInst)
+public enum EnclosingAccessScope {
+  case access(BeginAccessInst)
   case base(AccessBase)
+  case dependence(MarkDependenceInst)
+
+  // TODO: make this non-optional after fixing AccessBase.global.
+  public var address: Value? {
+    switch self {
+    case let .access(beginAccess):
+      return beginAccess
+    case let .base(accessBase):
+      return accessBase.address
+    case let .dependence(markDep):
+      return markDep
+    }
+  }
+}
+
+// An AccessBase with the nested enclosing scopes that contain the original address in bottom-up order.
+public struct AccessBaseAndScopes {
+  public let base: AccessBase
+  public let scopes: SingleInlineArray<EnclosingAccessScope>
+
+  public init(base: AccessBase, scopes: SingleInlineArray<EnclosingAccessScope>) {
+    self.base = base
+    self.scopes = scopes
+  }
+
+  public var enclosingAccess: EnclosingAccessScope {
+    return scopes.first ?? .base(base)
+  }
+
+  public var innermostAccess: BeginAccessInst? {
+    for scope in scopes {
+      if case let .access(beginAccess) = scope {
+        return beginAccess
+      }
+    }
+    return nil
+  }
+}
+
+extension AccessBaseAndScopes {
+  // This must return false if a mark_dependence scope is present.
+  public var isOnlyReadAccess: Bool {
+    scopes.allSatisfy(
+      {
+        if case let .access(beginAccess) = $0 {
+          return beginAccess.accessKind == .read
+        }
+        // preserve any dependence scopes.
+        return false
+      })
+  }
+}
+
+extension BeginAccessInst {
+  // Recognize an access scope for a unsafe addressor:
+  // %adr = pointer_to_address
+  // %md = mark_dependence %adr
+  // begin_access [unsafe] %md
+  public var unsafeAddressorSelf: Value? {
+    guard self.isUnsafe else {
+      return nil
+    }
+    switch self.address.enclosingAccessScope {
+    case .access, .base:
+      return nil
+    case let .dependence(markDep):
+      switch markDep.value.enclosingAccessScope {
+      case .access, .dependence:
+        return nil
+      case let .base(accessBase):
+        guard case .pointer = accessBase else {
+          return nil
+        }
+        return markDep.base
+      }
+    }
+  }
 }
 
 private struct EnclosingAccessWalker : AddressUseDefWalker {
-  var enclosingScope: EnclosingScope?
+  var enclosingScope: EnclosingAccessScope?
 
   mutating func walk(startAt address: Value, initialPath: UnusedWalkingPath = UnusedWalkingPath()) {
     if walkUp(address: address, path: UnusedWalkingPath()) == .abortWalk {
@@ -522,19 +647,24 @@ private struct EnclosingAccessWalker : AddressUseDefWalker {
   }
 
   mutating func walkUp(address: Value, path: UnusedWalkingPath) -> WalkResult {
-    if let ba = address as? BeginAccessInst {
-      enclosingScope = .scope(ba)
+    switch address {
+    case let ba as BeginAccessInst:
+      enclosingScope = .access(ba)
       return .continueWalk
+    case let md as MarkDependenceInst:
+      enclosingScope = .dependence(md)
+      return .continueWalk
+    default:
+      return walkUpDefault(address: address, path: path)
     }
-    return walkUpDefault(address: address, path: path)
   }
 }
 
 private struct AccessPathWalker : AddressUseDefWalker {
   var result = AccessPath.unidentified()
 
-  // List of nested BeginAccessInst: inside-out order.
-  var foundBeginAccesses = SingleInlineArray<BeginAccessInst>()
+  // List of nested BeginAccessInst & MarkDependenceInst: inside-out order.
+  var foundEnclosingScopes = SingleInlineArray<EnclosingAccessScope>()
 
   let enforceConstantProjectionPath: Bool
 
@@ -602,7 +732,9 @@ private struct AccessPathWalker : AddressUseDefWalker {
       // projection. Bail out
       return .abortWalk
     } else if let ba = address as? BeginAccessInst {
-      foundBeginAccesses.push(ba)
+      foundEnclosingScopes.push(.access(ba))
+    } else if let md = address as? MarkDependenceInst {
+      foundEnclosingScopes.push(.dependence(md))
     }
     return walkUpDefault(address: address, path: path.with(indexAddr: false))
   }
@@ -614,7 +746,7 @@ extension Value {
   // Although an AccessPathWalker is created for each call of these properties,
   // it's very unlikely that this will end up in memory allocations.
   // Only in the rare case of `pointer_to_address` -> `address_to_pointer` pairs, which
-  // go through phi-arguments, the AccessPathWalker will allocate memnory in its cache.
+  // go through phi-arguments, the AccessPathWalker will allocate memory in its cache.
 
   /// Computes the access base of this address value.
   public var accessBase: AccessBase { accessPath.base }
@@ -655,20 +787,21 @@ extension Value {
   public var accessPathWithScope: (AccessPath, scope: BeginAccessInst?) {
     var walker = AccessPathWalker()
     walker.walk(startAt: self)
-    return (walker.result, walker.foundBeginAccesses.first)
+    let baseAndScopes = AccessBaseAndScopes(base: walker.result.base, scopes: walker.foundEnclosingScopes)
+    return (walker.result, baseAndScopes.innermostAccess)
   }
 
   /// Computes the enclosing access scope of this address value.
-  public var enclosingAccessScope: EnclosingScope {
+  public var enclosingAccessScope: EnclosingAccessScope {
     var walker = EnclosingAccessWalker()
     walker.walk(startAt: self)
     return walker.enclosingScope ?? .base(.unidentified)
   }
 
-  public var accessBaseWithScopes: (AccessBase, SingleInlineArray<BeginAccessInst>) {
+  public var accessBaseWithScopes: AccessBaseAndScopes {
     var walker = AccessPathWalker()
     walker.walk(startAt: self)
-    return (walker.result.base, walker.foundBeginAccesses)
+    return AccessBaseAndScopes(base: walker.result.base, scopes: walker.foundEnclosingScopes)
   }
 
   /// The root definition of a reference, obtained by skipping ownership forwarding and ownership transition.

@@ -833,16 +833,6 @@ DisableImplicitStringProcessingImport("disable-implicit-string-processing-module
                                       llvm::cl::desc("Disable implicit import of _StringProcessing module"),
                                       llvm::cl::init(false));
 
-static llvm::cl::opt<bool>
-EnableImplicitBacktracingImport("enable-implicit-backtracing-module-import",
-                                 llvm::cl::desc("Enable implicit import of _Backtracing module"),
-                                 llvm::cl::init(false));
-
-static llvm::cl::opt<bool>
-DisableImplicitBacktracingImport("disable-implicit-backtracing-module-import",
-                                 llvm::cl::desc("Disable implicit import of _Backtracing module"),
-                                 llvm::cl::init(false));
-
 static llvm::cl::opt<bool> EnableExperimentalNamedOpaqueTypes(
     "enable-experimental-named-opaque-types",
     llvm::cl::desc("Enable experimental support for named opaque result types"),
@@ -2352,15 +2342,19 @@ private:
     return true;
   }
 
-  bool visitDeclReference(ValueDecl *D, CharSourceRange Range,
-                          TypeDecl *CtorTyRef, ExtensionDecl *ExtTyRef, Type Ty,
+  bool visitDeclReference(ValueDecl *D, SourceRange Range, TypeDecl *CtorTyRef,
+                          ExtensionDecl *ExtTyRef, Type Ty,
                           ReferenceMetaData Data) override {
-    if (!Data.isImplicit)
-      annotateSourceEntity({ Range, D, CtorTyRef, /*IsRef=*/true });
+    if (Data.isImplicit) {
+      return true;
+    }
+    CharSourceRange CharRange = Lexer::getCharSourceRangeFromSourceRange(
+        D->getASTContext().SourceMgr, Range);
+    annotateSourceEntity({CharRange, D, CtorTyRef, /*IsRef=*/true});
     return true;
   }
 
-  bool visitSubscriptReference(ValueDecl *D, CharSourceRange Range,
+  bool visitSubscriptReference(ValueDecl *D, SourceRange Range,
                                ReferenceMetaData Data,
                                bool IsOpenBracket) override {
     return visitDeclReference(D, Range, nullptr, nullptr, Type(), Data);
@@ -3919,11 +3913,13 @@ public:
     return true;
   }
 
-  bool visitDeclReference(ValueDecl *D, CharSourceRange Range,
-                          TypeDecl *CtorTyRef, ExtensionDecl *ExtTyRef, Type T,
+  bool visitDeclReference(ValueDecl *D, SourceRange Range, TypeDecl *CtorTyRef,
+                          ExtensionDecl *ExtTyRef, Type T,
                           ReferenceMetaData Data) override {
+    CharSourceRange CharRange = Lexer::getCharSourceRangeFromSourceRange(
+        D->getASTContext().SourceMgr, Range);
     if (SeenDecls.insert(D).second)
-      tryDemangleDecl(D, Range, /*isRef=*/true);
+      tryDemangleDecl(D, CharRange, /*isRef=*/true);
 
     if (T) {
       T = T->getRValueType();
@@ -3931,7 +3927,7 @@ public:
                       (NestedDCs.empty()
                        ? D->getDeclContext()
                        : NestedDCs.back()),
-                      Range);
+                      CharRange);
     }
     return true;
   }
@@ -4398,13 +4394,13 @@ int main(int argc, char *argv[]) {
     InitInvok.getFrontendOptions().InputsAndOutputs.addInputFile(File);
 
   for (const auto &featureArg : options::EnableExperimentalFeatures) {
-    if (auto feature = getExperimentalFeature(featureArg)) {
+    if (auto feature = Feature::getExperimentalFeature(featureArg)) {
       InitInvok.getLangOptions().enableFeature(*feature);
     }
   }
 
   for (const auto &featureArg : options::EnableUpcomingFeatures) {
-    if (auto feature = getUpcomingFeature(featureArg)) {
+    if (auto feature = Feature::getUpcomingFeature(featureArg)) {
       InitInvok.getLangOptions().enableFeature(*feature);
     }
   }
@@ -4470,13 +4466,6 @@ int main(int argc, char *argv[]) {
   if (options::DisableImplicitStringProcessingImport) {
     InitInvok.getLangOptions().DisableImplicitStringProcessingModuleImport = true;
   }
-  if (options::DisableImplicitBacktracingImport) {
-    InitInvok.getLangOptions().DisableImplicitBacktracingModuleImport = true;
-  } else if (options::EnableImplicitBacktracingImport) {
-    InitInvok.getLangOptions().DisableImplicitBacktracingModuleImport = false;
-  } else {
-    InitInvok.getLangOptions().DisableImplicitBacktracingModuleImport = true;
-  }
 
   if (options::EnableExperimentalNamedOpaqueTypes) {
     InitInvok.getLangOptions().enableFeature(Feature::NamedOpaqueTypes);
@@ -4541,6 +4530,9 @@ int main(int argc, char *argv[]) {
     options::ImportObjCHeader;
   InitInvok.getClangImporterOptions().BridgingHeader =
     options::ImportObjCHeader;
+  if (!options::ImportObjCHeader.empty())
+    InitInvok.getFrontendOptions().ModuleHasBridgingHeader = true;
+
   InitInvok.getLangOptions().EnableAccessControl =
     !options::DisableAccessControl;
   InitInvok.getLangOptions().EnableDeserializationSafety =
@@ -4644,41 +4636,43 @@ int main(int argc, char *argv[]) {
     }
   }
 
-  PrintOptions PrintOpts;
-  if (options::PrintInterface) {
-    PrintOpts = PrintOptions::printModuleInterface(
+  PrintOptions PrintOpts = [&] {
+    if (options::PrintInterface) {
+      return PrintOptions::printModuleInterface(
         InitInvok.getFrontendOptions().PrintFullConvention);
-  } else if (options::PrintInterfaceForDoc) {
-    PrintOpts = PrintOptions::printDocInterface();
-  } else {
-    PrintOpts = PrintOptions::printEverything();
-    PrintOpts.FullyQualifiedTypes = options::FullyQualifiedTypes;
-    PrintOpts.FullyQualifiedTypesIfAmbiguous =
-      options::FullyQualifiedTypesIfAmbiguous;
-    PrintOpts.SynthesizeSugarOnTypes = options::SynthesizeSugarOnTypes;
-    PrintOpts.AbstractAccessors = options::AbstractAccessors;
-    PrintOpts.FunctionDefinitions = options::FunctionDefinitions;
-    PrintOpts.PrintExprs = options::Expressions;
-    PrintOpts.PreferTypeRepr = options::PreferTypeRepr;
-    PrintOpts.ExplodePatternBindingDecls = options::ExplodePatternBindingDecls;
-    PrintOpts.PrintImplicitAttrs = options::PrintImplicitAttrs;
-    PrintOpts.PrintAccess = options::PrintAccess;
-    PrintOpts.AccessFilter = options::AccessFilter;
-    PrintOpts.PrintDocumentationComments = !options::SkipDocumentationComments;
-    PrintOpts.SkipPrivateSystemDecls = options::SkipPrivateSystemDecls;
-    PrintOpts.SkipUnsafeCXXMethods = options::SkipUnsafeCXXMethods;
-    PrintOpts.SkipUnavailable = options::SkipUnavailable;
-    PrintOpts.SkipDeinit = options::SkipDeinit;
-    PrintOpts.SkipImports = options::SkipImports;
-    PrintOpts.SkipOverrides = options::SkipOverrides;
-    if (options::SkipParameterNames) {
-      PrintOpts.ArgAndParamPrinting
-        = PrintOptions::ArgAndParamPrintingMode::ArgumentOnly;
-    } else if (options::AlwaysArgumentLabels) {
-      PrintOpts.ArgAndParamPrinting
-        = PrintOptions::ArgAndParamPrintingMode::BothAlways;
+    } else if (options::PrintInterfaceForDoc) {
+      return PrintOptions::printDocInterface();
+    } else {
+      auto PrintOpts = PrintOptions::printEverything();
+      PrintOpts.FullyQualifiedTypes = options::FullyQualifiedTypes;
+      PrintOpts.FullyQualifiedTypesIfAmbiguous =
+        options::FullyQualifiedTypesIfAmbiguous;
+      PrintOpts.SynthesizeSugarOnTypes = options::SynthesizeSugarOnTypes;
+      PrintOpts.AbstractAccessors = options::AbstractAccessors;
+      PrintOpts.FunctionDefinitions = options::FunctionDefinitions;
+      PrintOpts.PrintExprs = options::Expressions;
+      PrintOpts.PreferTypeRepr = options::PreferTypeRepr;
+      PrintOpts.ExplodePatternBindingDecls = options::ExplodePatternBindingDecls;
+      PrintOpts.PrintImplicitAttrs = options::PrintImplicitAttrs;
+      PrintOpts.PrintAccess = options::PrintAccess;
+      PrintOpts.AccessFilter = options::AccessFilter;
+      PrintOpts.PrintDocumentationComments = !options::SkipDocumentationComments;
+      PrintOpts.SkipPrivateSystemDecls = options::SkipPrivateSystemDecls;
+      PrintOpts.SkipUnsafeCXXMethods = options::SkipUnsafeCXXMethods;
+      PrintOpts.SkipUnavailable = options::SkipUnavailable;
+      PrintOpts.SkipDeinit = options::SkipDeinit;
+      PrintOpts.SkipImports = options::SkipImports;
+      PrintOpts.SkipOverrides = options::SkipOverrides;
+      if (options::SkipParameterNames) {
+        PrintOpts.ArgAndParamPrinting
+          = PrintOptions::ArgAndParamPrintingMode::ArgumentOnly;
+      } else if (options::AlwaysArgumentLabels) {
+        PrintOpts.ArgAndParamPrinting
+          = PrintOptions::ArgAndParamPrintingMode::BothAlways;
+      }
+      return PrintOpts;
     }
-  }
+  }();
   if (options::SkipUnderscoredSystemProtocols)
     PrintOpts.SkipUnderscoredSystemProtocols = true;
   if (options::PrintOriginalSourceText)

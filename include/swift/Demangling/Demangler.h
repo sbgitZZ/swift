@@ -570,6 +570,8 @@ protected:
   NodePointer demangleImplParamConvention(Node::Kind ConvKind);
   NodePointer demangleImplResultConvention(Node::Kind ConvKind);
   NodePointer demangleImplParameterSending();
+  NodePointer demangleImplParameterIsolated();
+  NodePointer demangleImplParameterImplicitLeading();
   NodePointer demangleImplParameterResultDifferentiability();
   NodePointer demangleImplFunctionType();
   NodePointer demangleClangType();
@@ -596,6 +598,7 @@ protected:
   NodePointer demangleDependentProtocolConformanceInherited();
   NodePointer popDependentAssociatedConformance();
   NodePointer demangleDependentProtocolConformanceAssociated();
+  NodePointer demangleDependentProtocolConformanceOpaque();
   NodePointer demangleThunkOrSpecialization();
   NodePointer demangleGenericSpecialization(Node::Kind SpecKind,
                                             NodePointer droppedArguments);

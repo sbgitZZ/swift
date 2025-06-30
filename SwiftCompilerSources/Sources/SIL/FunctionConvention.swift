@@ -26,10 +26,14 @@ public struct FunctionConvention : CustomStringConvertible {
   let functionType: CanonicalType
   let hasLoweredAddresses: Bool
 
-  init(for functionType: CanonicalType, in function: Function) {
+  public init(for functionType: CanonicalType, in function: Function) {
+    self.init(for: functionType, hasLoweredAddresses: function.hasLoweredAddresses)
+  }
+
+  public init(for functionType: CanonicalType, hasLoweredAddresses: Bool) {
     assert(!functionType.hasTypeParameter, "requires contextual type")
     self.functionType = functionType
-    self.hasLoweredAddresses = function.hasLoweredAddresses
+    self.hasLoweredAddresses = hasLoweredAddresses
   }
 
   /// All results including the error.
@@ -53,11 +57,15 @@ public struct FunctionConvention : CustomStringConvertible {
     : SILFunctionType_getNumPackResults(functionType.bridged)
   }
 
-  /// Indirect results including the error.
-  public var indirectSILResults: LazyFilterSequence<Results> {
-    hasLoweredAddresses
-    ? results.lazy.filter { $0.isSILIndirect }
-    : results.lazy.filter { $0.convention == .pack }
+  /// Returns the indirect result - including the error - at `index`.
+  public func indirectSILResult(at index: Int) -> ResultInfo {
+    let indirectResults = results.lazy.filter {
+      hasLoweredAddresses ? $0.isSILIndirect : $0.convention == .pack
+    }
+    // Note that subscripting a LazyFilterCollection (with the base index, e.g. `Int`) does not work
+    // as expected, because it returns the nth element of the base collection!
+    // Therefore we need to implement the subscript "manually".
+    return indirectResults.enumerated().first{ $0.offset == index }!.element
   }
 
   public var parameters: Parameters {
@@ -122,7 +130,7 @@ public struct ResultInfo : CustomStringConvertible {
   public var isSILIndirect: Bool {
     switch convention {
     case .indirect:
-      return hasLoweredAddresses || type.isOpenedExistentialWithError()
+      return hasLoweredAddresses || type.isExistentialArchetypeWithError()
     case .pack:
       return true
     case .owned, .unowned, .unownedInnerPointer, .autoreleased:
@@ -163,6 +171,15 @@ public struct ParameterInfo : CustomStringConvertible {
   public let convention: ArgumentConvention
   public let options: UInt8
   public let hasLoweredAddresses: Bool
+  
+  // Must be kept consistent with 'SILParameterInfo::Flag'
+  public enum Flag : UInt8 {
+    case notDifferentiable = 0x1
+    case sending = 0x2
+    case isolated = 0x4
+    case implicitLeading = 0x8
+    case const = 0x10
+  };
 
   public init(type: CanonicalType, convention: ArgumentConvention, options: UInt8, hasLoweredAddresses: Bool) {
     self.type = type
@@ -178,7 +195,7 @@ public struct ParameterInfo : CustomStringConvertible {
   public var isSILIndirect: Bool {
     switch convention {
     case .indirectIn, .indirectInGuaranteed:
-      return hasLoweredAddresses || type.isOpenedExistentialWithError
+      return hasLoweredAddresses || type.isExistentialArchetypeWithError
     case .indirectInout, .indirectInoutAliasable, .indirectInCXX:
       return true
     case .directOwned, .directUnowned, .directGuaranteed:
@@ -193,10 +210,14 @@ public struct ParameterInfo : CustomStringConvertible {
   public var description: String {
     "\(convention): \(type)"
   }
+  
+  public func hasOption(_ flag: Flag) -> Bool {
+    return options & flag.rawValue != 0
+  }
 }
 
 extension FunctionConvention {
-  public struct Parameters : Collection {
+  public struct Parameters : RandomAccessCollection {
     let bridged: BridgedParameterInfoArray
     let hasLoweredAddresses: Bool
 
@@ -237,7 +258,25 @@ extension FunctionConvention {
 
 public enum LifetimeDependenceConvention : CustomStringConvertible {
   case inherit
-  case scope
+  case scope(addressable: Bool, addressableForDeps: Bool)
+
+  public var isScoped: Bool {
+    switch self {
+    case .inherit:
+      return false
+    case .scope:
+      return true
+    }
+  }
+
+  public func isAddressable(for value: Value) -> Bool {
+    switch self {
+    case .inherit:
+      return false
+    case let .scope(addressable, addressableForDeps):
+      return addressable || (addressableForDeps && value.type.isAddressableForDeps(in: value.parentFunction))
+    }
+  }
 
   public var description: String {
     switch self {
@@ -294,7 +333,9 @@ extension FunctionConvention {
         return .inherit
       }
       if scope {
-        return .scope
+        let addressable = bridged.checkAddressable(bridgedIndex(parameterIndex: index))
+        let addressableForDeps = bridged.checkConditionallyAddressable(bridgedIndex(parameterIndex: index))
+        return .scope(addressable: addressable, addressableForDeps: addressableForDeps)
       }
       return nil
     }

@@ -141,9 +141,18 @@ ConstraintSystem::~ConstraintSystem() {
 void ConstraintSystem::startExpressionTimer(ExpressionTimer::AnchorType anchor) {
   ASSERT(!Timer);
 
-  unsigned timeout = getASTContext().TypeCheckerOpts.ExpressionTimeoutThreshold;
-  if (timeout == 0)
-    return;
+  const auto &opts = getASTContext().TypeCheckerOpts;
+  unsigned timeout = opts.ExpressionTimeoutThreshold;
+
+  // If either the timeout is set, or we're asked to emit warnings,
+  // start the timer. Otherwise, don't start the timer, it's needless
+  // overhead.
+  if (timeout == 0) {
+    if (opts.WarnLongExpressionTypeChecking == 0)
+      return;
+
+    timeout = ExpressionTimer::NoLimit;
+  }
 
   Timer.emplace(anchor, *this, timeout);
 }
@@ -217,7 +226,7 @@ void ConstraintSystem::assignFixedType(TypeVariableType *typeVar, Type type,
   assert(!type->hasError() &&
          "Should not be assigning a type involving ErrorType!");
 
-  CG.retractFromInference(typeVar, type);
+  CG.retractFromInference(typeVar);
   typeVar->getImpl().assignFixedType(type, getTrail());
 
   if (!updateState)
@@ -267,8 +276,7 @@ void ConstraintSystem::assignFixedType(TypeVariableType *typeVar, Type type,
 void ConstraintSystem::addTypeVariableConstraintsToWorkList(
        TypeVariableType *typeVar) {
   // Activate the constraints affected by a change to this type variable.
-  auto gatheringKind = ConstraintGraph::GatheringKind::AllMentions;
-  for (auto *constraint : CG.gatherConstraints(typeVar, gatheringKind))
+  for (auto *constraint : CG.gatherAllConstraints(typeVar))
     if (!constraint->isActive())
       activateConstraint(constraint);
 }
@@ -331,9 +339,14 @@ void ConstraintSystem::recordAppliedDisjunction(
 /// Retrieve a dynamic result signature for the given declaration.
 static std::tuple<char, ObjCSelector, CanType>
 getDynamicResultSignature(ValueDecl *decl) {
+  // Handle functions.
   if (auto func = dyn_cast<AbstractFunctionDecl>(decl)) {
-    // Handle functions.
-    auto type = func->getMethodInterfaceType();
+    // Strip `@Sendable` and `any Sendable` because it should be
+    // possible to add them without affecting lookup results and
+    // shadowing. All of the declarations that are processed here
+    // are `@objc` and hence `@preconcurrency`.
+    auto type = func->getMethodInterfaceType()->stripConcurrency(
+        /*recursive=*/true, /*dropGlobalActor=*/false);
     return std::make_tuple(func->isStatic(), func->getObjCSelector(),
                            type->getCanonicalType());
   }
@@ -488,7 +501,7 @@ void ConstraintSystem::recordPotentialThrowSite(
 
   // do..catch statements without an explicit `throws` clause do infer
   // thrown types.
-  if (auto doCatch = catchNode.dyn_cast<DoCatchStmt *>()) {
+  if (catchNode.is<DoCatchStmt *>()) {
     PotentialThrowSite site{kind, type, getConstraintLocator(locator)};
     recordPotentialThrowSite(catchNode, site);
     return;
@@ -507,7 +520,7 @@ void ConstraintSystem::recordPotentialThrowSite(
   recordPotentialThrowSite(catchNode, site);
 }
 
-Type ConstraintSystem::getCaughtErrorType(CatchNode catchNode) {
+Type ConstraintSystem::getExplicitCaughtErrorType(CatchNode catchNode) {
   ASTContext &ctx = getASTContext();
 
   // If there is an explicit caught type for this node, use it.
@@ -517,6 +530,16 @@ Type ConstraintSystem::getCaughtErrorType(CatchNode catchNode) {
 
     return explicitCaughtType;
   }
+
+  return Type();
+}
+
+Type ConstraintSystem::getCaughtErrorType(CatchNode catchNode) {
+  ASTContext &ctx = getASTContext();
+
+  // If we have an explicit caught error type for this node, use it.
+  if (auto explicitCaughtType = getExplicitCaughtErrorType(catchNode))
+    return explicitCaughtType;
 
   // Retrieve the thrown error type of a closure.
   // FIXME: This will need to change when we do inference of thrown error
@@ -644,7 +667,7 @@ ConstraintLocator *ConstraintSystem::getImplicitValueConversionLocator(
     // Drop any value-to-optional conversions that were applied along the
     // way to reach this one.
     while (!path.empty()) {
-      if (path.back().is<LocatorPathElt::OptionalPayload>()) {
+      if (path.back().is<LocatorPathElt::OptionalInjection>()) {
         path.pop_back();
         continue;
       }
@@ -716,11 +739,14 @@ ConstraintLocator *ConstraintSystem::getCalleeLocator(
   }
 
   if (locator->isLastElement<LocatorPathElt::ArgumentAttribute>()) {
-    return getConstraintLocator(anchor, path.drop_back());
+    auto argLoc = getConstraintLocator(anchor, path.drop_back());
+    return getCalleeLocator(argLoc, lookThroughApply, getType, simplifyType,
+                            getOverloadFor);
   }
 
   // If we have a locator that starts with a key path component element, we
-  // may have a callee given by a property or subscript component.
+  // may have a callee given by a property, subscript, initializer, or method
+  // component.
   if (auto componentElt =
       locator->getFirstElementAs<LocatorPathElt::KeyPathComponent>()) {
     auto *kpExpr = castToExpr<KeyPathExpr>(anchor);
@@ -733,13 +759,16 @@ ConstraintLocator *ConstraintSystem::getCalleeLocator(
       // For a subscript the callee is given by 'component -> subscript member'.
       return getConstraintLocator(
                                   anchor, {*componentElt, ConstraintLocator::SubscriptMember});
-    case ComponentKind::UnresolvedProperty:
-    case ComponentKind::Property:
+    case ComponentKind::UnresolvedMember:
+    case ComponentKind::Member:
       // For a property, the choice is just given by the component.
       return getConstraintLocator(anchor, *componentElt);
     case ComponentKind::TupleElement:
       llvm_unreachable("Not implemented by CSGen");
       break;
+    case ComponentKind::UnresolvedApply:
+    case ComponentKind::Apply:
+      return getConstraintLocator(anchor, *componentElt);
     case ComponentKind::Invalid:
     case ComponentKind::OptionalForce:
     case ComponentKind::OptionalChain:
@@ -853,14 +882,14 @@ ConstraintLocator *ConstraintSystem::getOpenOpaqueLocator(
       { LocatorPathElt::OpenedOpaqueArchetype(opaqueDecl) }, 0);
 }
 
-std::pair<Type, OpenedArchetypeType *>
+std::pair<Type, ExistentialArchetypeType *>
 ConstraintSystem::openAnyExistentialType(Type type,
                                          ConstraintLocator *locator) {
-  Type result = OpenedArchetypeType::getAny(type);
+  Type result = ExistentialArchetypeType::getAny(type);
   Type t = result;
   while (t->is<MetatypeType>())
     t = t->getMetatypeInstanceType();
-  auto *opened = t->castTo<OpenedArchetypeType>();
+  auto *opened = t->castTo<ExistentialArchetypeType>();
 
   recordOpenedExistentialType(locator, opened);
 
@@ -868,7 +897,7 @@ ConstraintSystem::openAnyExistentialType(Type type,
 }
 
 void ConstraintSystem::recordOpenedExistentialType(
-    ConstraintLocator *locator, OpenedArchetypeType *opened) {
+    ConstraintLocator *locator, ExistentialArchetypeType *opened) {
   bool inserted = OpenedExistentialTypes.insert({locator, opened}).second;
   ASSERT(inserted);
 
@@ -877,59 +906,51 @@ void ConstraintSystem::recordOpenedExistentialType(
 }
 
 GenericEnvironment *
-ConstraintSystem::getPackElementEnvironment(ConstraintLocator *locator,
-                                            CanType shapeClass) {
-  assert(locator->directlyAt<PackExpansionExpr>());
-
-  std::pair<UUID, Type> uuidAndShape;
-  auto result = PackExpansionEnvironments.find(locator);
-  if (result == PackExpansionEnvironments.end()) {
-    uuidAndShape = std::make_pair(UUID::fromTime(), shapeClass);
-    recordPackExpansionEnvironment(locator, uuidAndShape);
-  } else {
-    uuidAndShape = result->second;
-  }
-
-  if (!shapeClass->is<PackArchetypeType>() ||
-      !shapeClass->isEqual(uuidAndShape.second))
+ConstraintSystem::getPackExpansionEnvironment(PackExpansionExpr *expr) const {
+  auto result = PackExpansionEnvironments.find(expr);
+  if (result == PackExpansionEnvironments.end())
     return nullptr;
 
-  auto shapeParam = cast<GenericTypeParamType>(
-      shapeClass->mapTypeOutOfContext()->getCanonicalType());
-
-  auto &ctx = getASTContext();
-  auto *contextEnv = PackElementGenericEnvironments.empty()
-                         ? DC->getGenericEnvironmentOfContext()
-                         : PackElementGenericEnvironments.back();
-  auto elementSig = ctx.getOpenedElementSignature(
-      contextEnv->getGenericSignature().getCanonicalSignature(), shapeParam);
-  auto contextSubs = contextEnv->getForwardingSubstitutionMap();
-  return GenericEnvironment::forOpenedElement(elementSig, uuidAndShape.first,
-                                              shapeParam, contextSubs);
+  return result->second;
 }
 
-void ConstraintSystem::recordPackExpansionEnvironment(
-    ConstraintLocator *locator, std::pair<UUID, Type> uuidAndShape) {
-  bool inserted = PackExpansionEnvironments.insert({locator, uuidAndShape}).second;
+GenericEnvironment *ConstraintSystem::createPackExpansionEnvironment(
+    PackExpansionExpr *expr, CanGenericTypeParamType shapeParam) {
+  auto *contextEnv = DC->getGenericEnvironmentOfContext();
+  auto elementSig = getASTContext().getOpenedElementSignature(
+      contextEnv->getGenericSignature().getCanonicalSignature(), shapeParam);
+  auto contextSubs = contextEnv->getForwardingSubstitutionMap();
+  auto *env = GenericEnvironment::forOpenedElement(elementSig, UUID::fromTime(),
+                                                   shapeParam, contextSubs);
+  recordPackExpansionEnvironment(expr, env);
+  return env;
+}
+
+void ConstraintSystem::recordPackExpansionEnvironment(PackExpansionExpr *expr,
+                                                      GenericEnvironment *env) {
+  bool inserted = PackExpansionEnvironments.insert({expr, env}).second;
   ASSERT(inserted);
 
   if (solverState)
-    recordChange(SolverTrail::Change::RecordedPackExpansionEnvironment(locator));
+    recordChange(SolverTrail::Change::RecordedPackExpansionEnvironment(expr));
 }
 
 PackExpansionExpr *
-ConstraintSystem::getPackEnvironment(PackElementExpr *packElement) const {
-  const auto match = PackEnvironments.find(packElement);
-  return (match == PackEnvironments.end()) ? nullptr : match->second;
+ConstraintSystem::getPackElementExpansion(PackElementExpr *packElement) const {
+  const auto match = PackElementExpansions.find(packElement);
+  return (match == PackElementExpansions.end()) ? nullptr : match->second;
 }
 
-void ConstraintSystem::addPackEnvironment(PackElementExpr *packElement,
-                                          PackExpansionExpr *packExpansion) {
-  bool inserted = PackEnvironments.insert({packElement, packExpansion}).second;
+void ConstraintSystem::recordPackElementExpansion(
+    PackElementExpr *packElement, PackExpansionExpr *packExpansion) {
+  bool inserted =
+      PackElementExpansions.insert({packElement, packExpansion}).second;
   ASSERT(inserted);
 
-  if (solverState)
-    recordChange(SolverTrail::Change::RecordedPackEnvironment(packElement));
+  if (solverState) {
+    recordChange(
+        SolverTrail::Change::RecordedPackElementExpansion(packElement));
+  }
 }
 
 /// Extend the given depth map by adding depths for all of the subexpressions
@@ -1074,7 +1095,7 @@ Type ConstraintSystem::getFixedTypeRecursive(Type type, TypeMatchOptions &flags,
 
   // Tuple types can lose their tuple structure under substitution
   // when a parameter pack is substituted with one element.
-  if (auto tuple = type->getAs<TupleType>()) {
+  if (type->is<TupleType>()) {
     auto simplified = simplifyType(type);
     if (simplified.getPointer() == type.getPointer())
       return type;
@@ -1082,7 +1103,7 @@ Type ConstraintSystem::getFixedTypeRecursive(Type type, TypeMatchOptions &flags,
     return getFixedTypeRecursive(simplified, flags, wantRValue);
   }
 
-  if (auto metatype = type->getAs<AnyMetatypeType>()) {
+  if (type->is<AnyMetatypeType>()) {
     auto simplified = simplifyType(type);
     if (simplified.getPointer() == type.getPointer())
       return type;
@@ -1403,6 +1424,7 @@ FunctionType::ExtInfo ClosureEffectsRequest::evaluate(
   bool throws = expr->getThrowsLoc().isValid();
   bool async = expr->getAsyncLoc().isValid();
   bool sendable = expr->getAttrs().hasAttribute<SendableAttr>();
+
   if (throws || async) {
     return ASTExtInfoBuilder()
       .withThrows(throws, /*FIXME:*/Type())
@@ -1416,11 +1438,17 @@ FunctionType::ExtInfo ClosureEffectsRequest::evaluate(
   if (!body)
     return ASTExtInfoBuilder().withSendable(sendable).build();
 
+  // `@concurrent` attribute is only valid on asynchronous function types.
+  bool asyncFromAttr = false;
+  if (expr->getAttrs().hasAttribute<ConcurrentAttr>()) {
+    asyncFromAttr = true;
+  }
+
   auto throwFinder = FindInnerThrows(expr);
   body->walk(throwFinder);
   return ASTExtInfoBuilder()
       .withThrows(throwFinder.foundThrow(), /*FIXME:*/Type())
-      .withAsync(bool(findAsyncNode(expr)))
+      .withAsync(asyncFromAttr || bool(findAsyncNode(expr)))
       .withSendable(sendable)
       .build();
 }
@@ -1666,6 +1694,20 @@ struct TypeSimplifier {
         auto *proto = assocType->getProtocol();
         auto conformance = CS.lookupConformance(lookupBaseType, proto);
         if (!conformance) {
+          // Special case: When building slab literals, we go through the same
+          // array literal machinery, so there will be a conversion constraint
+          // for the element to ExpressibleByArrayLiteral.ArrayLiteralType.
+          if (lookupBaseType->isInlineArray()) {
+            auto &ctx = CS.getASTContext();
+            auto arrayProto =
+                ctx.getProtocol(KnownProtocolKind::ExpressibleByArrayLiteral);
+            auto elementAssocTy = arrayProto->getAssociatedTypeMembers()[0];
+
+            if (proto == arrayProto && assocType == elementAssocTy) {
+              return lookupBaseType->getInlineArrayElementType();
+            }
+          }
+
           // If the base type doesn't conform to the associatedtype's protocol,
           // there will be a missing conformance fix applied in diagnostic mode,
           // so the concrete dependent member type is considered a "hole" in
@@ -1679,7 +1721,7 @@ struct TypeSimplifier {
           return memberTy;
         }
 
-        auto result = conformance.getTypeWitness(lookupBaseType, assocType);
+        auto result = conformance.getTypeWitness(assocType);
         if (result && !result->hasError())
           return result;
       }
@@ -1853,6 +1895,39 @@ Type Solution::simplifyTypeForCodeCompletion(Type Ty) const {
     return typeVar;
   });
 
+  // Logic to determine the contextual type inside buildBlock result builders:
+  //
+  // When completing inside a result builder, the result builder
+  //   @ViewBuilder var body: some View {
+  //     Text("Foo")
+  //     #^COMPLETE^#
+  //   }
+  // gets rewritten to
+  //   @ViewBuilder var body: some View {
+  //     let $__builder2: Text
+  //     let $__builder0 = Text("Foo")
+  //     let $__builder1 = #^COMPLETE^#
+  //     $__builder2 = ViewBuilder.buildBlock($__builder0, $__builder1)
+  //     return $__builder2
+  //   }
+  // Inside the constraint system
+  //     let $__builder1 = #^COMPLETE^#
+  // gets type checked without context, so we can't know the contextual type for
+  // the code completion token. But we know that $__builder1 (and thus the type
+  // of #^COMPLETE^#) is used as the second argument to ViewBuilder.buildBlock,
+  // so we can extract the contextual type from that call. To do this, figure
+  // out the type variable that is used for $__builder1 in the buildBlock call.
+  // This type variable is connected to the type variable of $__builder1's
+  // definition by a one-way constraint.
+  if (auto TV = Ty->getAs<TypeVariableType>()) {
+    for (auto constraint : CS.getConstraintGraph()[TV].getConstraints()) {
+      if (constraint->getKind() == ConstraintKind::OneWayEqual &&
+          constraint->getSecondType()->isEqual(TV)) {
+        return simplifyTypeForCodeCompletion(constraint->getFirstType());
+      }
+    }
+  }
+
   // Remove any remaining type variables and placeholders
   Ty = simplifyType(Ty);
 
@@ -1869,6 +1944,7 @@ size_t Solution::getTotalMemory() const {
   if (TotalMemory)
     return *TotalMemory;
 
+  // clang-format off
   const_cast<Solution *>(this)->TotalMemory
        = sizeof(*this) + size_in_bytes(typeBindings) +
          overloadChoices.getMemorySize() +
@@ -1878,7 +1954,7 @@ size_t Solution::getTotalMemory() const {
          OpenedTypes.getMemorySize() + OpenedExistentialTypes.getMemorySize() +
          OpenedPackExpansionTypes.getMemorySize() +
          PackExpansionEnvironments.getMemorySize() +
-         size_in_bytes(PackEnvironments) +
+         size_in_bytes(PackElementExpansions) +
          (DefaultedConstraints.size() * sizeof(void *)) +
          nodeTypes.getMemorySize() +
          keyPathComponentTypes.getMemorySize() +
@@ -1894,6 +1970,7 @@ size_t Solution::getTotalMemory() const {
          size_in_bytes(argumentLists) +
          size_in_bytes(ImplicitCallAsFunctionRoots) +
          size_in_bytes(SynthesizedConformances);
+  // clang-format on
 
   return *TotalMemory;
 }
@@ -3462,7 +3539,7 @@ void constraints::simplifyLocator(ASTNode &anchor,
       LLVM_FALLTHROUGH;
 
     case ConstraintLocator::Member:
-      if (auto UDE = getAsExpr<UnresolvedDotExpr>(anchor)) {
+      if (isExpr<UnresolvedDotExpr>(anchor)) {
         path = path.slice(1);
         continue;
       }
@@ -3550,7 +3627,7 @@ void constraints::simplifyLocator(ASTNode &anchor,
       auto argIdx = applyArgElt->getArgIdx();
       if (auto *kpe = getAsExpr<KeyPathExpr>(anchor)) {
         auto component = kpe->getComponents()[elt.getIndex()];
-        auto *args = component.getSubscriptArgs();
+        auto *args = component.getArgs();
         assert(args && "Trying to apply a component without args?");
         if (argIdx < args->size()) {
           anchor = args->getExpr(argIdx);
@@ -3729,7 +3806,7 @@ void constraints::simplifyLocator(ASTNode &anchor,
 
     case ConstraintLocator::Witness:
     case ConstraintLocator::WrappedValue:
-    case ConstraintLocator::OptionalPayload:
+    case ConstraintLocator::OptionalInjection:
     case ConstraintLocator::ImplicitlyUnwrappedDisjunctionChoice:
     case ConstraintLocator::FallbackType:
     case ConstraintLocator::KeyPathSubscriptIndex:
@@ -3821,7 +3898,7 @@ Type constraints::isRawRepresentable(ConstraintSystem &cs, Type type) {
   if (conformance.isInvalid())
     return Type();
 
-  return conformance.getTypeWitnessByName(type, cs.getASTContext().Id_RawValue);
+  return conformance.getTypeWitnessByName(cs.getASTContext().Id_RawValue);
 }
 
 void ConstraintSystem::generateOverloadConstraints(
@@ -3998,6 +4075,15 @@ ASTNode ConstraintSystem::includingParentApply(ASTNode node) {
   return node;
 }
 
+GenericEnvironment *
+Solution::getPackExpansionEnvironment(PackExpansionExpr *expr) const {
+  auto iter = PackExpansionEnvironments.find(expr);
+  if (iter == PackExpansionEnvironments.end())
+    return nullptr;
+
+  return iter->second;
+}
+
 std::optional<FunctionArgApplyInfo>
 Solution::getFunctionArgApplyInfo(ConstraintLocator *locator) const {
   // It's only valid to use `&` in argument positions, but we need
@@ -4016,7 +4102,7 @@ Solution::getFunctionArgApplyInfo(ConstraintLocator *locator) const {
   // Look for the apply-arg-to-param element in the locator's path. We may
   // have to look through other elements that are generated from an argument
   // conversion such as GenericArgument for an optional-to-optional conversion,
-  // and OptionalPayload for a value-to-optional conversion.
+  // and OptionalInjection for a value-to-optional conversion.
   auto iter = path.rbegin();
   auto applyArgElt = locator->findLast<LocatorPathElt::ApplyArgToParam>(iter);
   if (!applyArgElt)
@@ -4230,7 +4316,7 @@ ConstraintLocator *ConstraintSystem::getArgumentLocator(Expr *expr) {
     if (!idx)
       return nullptr;
     loc = getConstraintLocator(KP, {LocatorPathElt::KeyPathComponent(*idx)});
-    argList = KP->getComponents()[*idx].getSubscriptArgs();
+    argList = KP->getComponents()[*idx].getArgs();
   } else {
     loc = getConstraintLocator(application);
   }
@@ -4291,7 +4377,7 @@ bool ConstraintSystem::isArgumentOfImportedDecl(
     // locator elements at the end of the path, they came from
     // either value-to-optional promotion or optional-to-optional
     // conversion.
-    if (last.is<LocatorPathElt::OptionalPayload>() ||
+    if (last.is<LocatorPathElt::OptionalInjection>() ||
         last.is<LocatorPathElt::GenericArgument>()) {
       path.pop_back();
       continue;
@@ -4333,11 +4419,9 @@ ConstraintSystem::isConversionEphemeral(ConversionRestrictionKind conversion,
 
       // Check what access strategy is used for a read-write access. It must be
       // direct-to-storage in order for the conversion to be non-ephemeral.
-      auto access = asd->getAccessStrategy(
+      return asd->isAccessedViaPhysicalStorage(
           AccessSemantics::Ordinary, AccessKind::ReadWrite,
-          DC->getParentModule(), DC->getResilienceExpansion(),
-          /*useOldABI=*/false);
-      return access.getKind() == AccessStrategy::Storage;
+          DC->getParentModule(), DC->getResilienceExpansion());
     };
 
     SourceRange range;
@@ -4506,6 +4590,8 @@ Expr *ConstraintSystem::buildAutoClosureExpr(Expr *expr,
 Expr *ConstraintSystem::buildTypeErasedExpr(Expr *expr, DeclContext *dc,
                                             Type contextualType,
                                             ContextualTypePurpose purpose) {
+  auto &ctx = dc->getASTContext();
+
   if (purpose != CTP_ReturnStmt)
     return expr;
 
@@ -4524,13 +4610,32 @@ Expr *ConstraintSystem::buildTypeErasedExpr(Expr *expr, DeclContext *dc,
     return expr;
 
   auto *PD = protocols.front();
-  auto *attr = PD->getAttrs().getAttribute<TypeEraserAttr>();
-  if (!attr)
+
+  auto contextAvailability =
+      AvailabilityContext::forLocation(expr->getLoc(), dc);
+  auto refinedAvailability =
+      AvailabilityContext::forPlatformRange(
+        AvailabilityRange::alwaysAvailable(), ctx);
+
+  // The least available type eraser for the enclosing context.
+  Type typeEraser;
+  for (auto *attr : PD->getAttrs().getAttributes<TypeEraserAttr>()) {
+    auto eraser = attr->getResolvedType(PD);
+    assert(eraser && "Failed to resolve eraser type!");
+
+    auto *nominal = eraser->getAnyNominal();
+    auto nominalAvailability = AvailabilityContext::forDeclSignature(nominal);
+
+    if (contextAvailability.isContainedIn(nominalAvailability) &&
+        nominalAvailability.isContainedIn(refinedAvailability)) {
+      refinedAvailability = nominalAvailability;
+      typeEraser = eraser;
+    }
+  }
+
+  if (!typeEraser)
     return expr;
 
-  auto typeEraser = attr->getResolvedType(PD);
-  assert(typeEraser && "Failed to resolve eraser type!");
-  auto &ctx = dc->getASTContext();
   auto *argList = ArgumentList::forImplicitSingle(ctx, ctx.Id_erasing, expr);
   return CallExpr::createImplicit(
       ctx, TypeExpr::createImplicit(typeEraser, ctx), argList);
@@ -4654,7 +4759,7 @@ void ConstraintSystem::diagnoseFailureFor(SyntacticElementTarget target) {
       nominal->diagnose(diag::property_wrapper_declared_here,
                         nominal->getName());
     }
-  } else if (auto *var = target.getAsUninitializedVar()) {
+  } else if (target.getAsUninitializedVar()) {
     DE.diagnose(target.getLoc(), diag::failed_to_produce_diagnostic);
   } else if (target.isForEachPreamble()) {
     DE.diagnose(target.getLoc(), diag::failed_to_produce_diagnostic);
@@ -4871,11 +4976,11 @@ bool ConstraintSystem::isReadOnlyKeyPathComponent(
   // If the setter is unavailable, then the keypath ought to be read-only
   // in this context.
   if (auto setter = storage->getOpaqueAccessor(AccessorKind::Set)) {
-    // FIXME: Fully unavailable setters should cause the key path to be
-    // readonly too.
+    // FIXME: [availability] Fully unavailable setters should cause the key path
+    // to be readonly too.
     auto constraint =
         getUnsatisfiedAvailabilityConstraint(setter, DC, referenceLoc);
-    if (constraint && constraint->isConditionallySatisfiable())
+    if (constraint && constraint->isPotentiallyAvailable())
       return true;
   }
 
@@ -4889,14 +4994,12 @@ bool ConstraintSystem::isArgumentGenericFunction(Type argType, Expr *argExpr) {
 
   // Have we bound an overload for the argument already?
   if (argExpr) {
-    auto locator = getConstraintLocator(argExpr);
-    auto knownOverloadBinding = ResolvedOverloads.find(locator);
-    if (knownOverloadBinding != ResolvedOverloads.end()) {
+    if (auto selectedOverload = findSelectedOverloadFor(argExpr)) {
       // If the overload choice is a generic function, then we have a generic
       // function reference.
-      auto choice = knownOverloadBinding->second;
-      if (auto func = dyn_cast_or_null<AbstractFunctionDecl>(
-              choice.choice.getDeclOrNull())) {
+      auto choice = selectedOverload->choice;
+      if (auto func =
+              dyn_cast_or_null<AbstractFunctionDecl>(choice.getDeclOrNull())) {
         if (func->isGeneric())
           return true;
       }
@@ -4980,6 +5083,36 @@ ConstraintSystem::inferKeyPathLiteralCapability(KeyPathExpr *keyPath) {
   if (rootTy->isPlaceholder())
     return fail();
 
+  auto isKnownSendability =
+      [&](const KeyPathExpr::Component &component) -> bool {
+    if (!Context.LangOpts.hasFeature(Feature::InferSendableFromCaptures))
+      return true;
+
+    // Key path is sendable only when all of its captures are sendable.
+    if (auto *args = component.getArgs()) {
+      auto *sendable = Context.getProtocol(KnownProtocolKind::Sendable);
+
+      for (const auto &arg : *args) {
+        // No need to check more or delay since we already know
+        // that the type is not Sendable.
+        if (!isSendable)
+          break;
+
+        auto argTy = simplifyType(getType(arg.getExpr()));
+
+        // Sendability cannot be determined until the argument
+        // is fully resolved.
+        if (argTy->hasTypeVariable())
+          return false;
+
+        auto conformance = lookupConformance(argTy, sendable);
+        isSendable &= bool(conformance) && !conformance.hasMissingConformance();
+      }
+    }
+
+    return true;
+  };
+
   auto mutability = KeyPathMutability::Writable;
   for (unsigned i : indices(keyPath->getComponents())) {
     auto &component = keyPath->getComponents()[i];
@@ -4993,37 +5126,20 @@ ConstraintSystem::inferKeyPathLiteralCapability(KeyPathExpr *keyPath) {
       return fail();
     }
 
+    case KeyPathExpr::Component::Kind::Apply:
+    case KeyPathExpr::Component::Kind::UnresolvedApply: {
+      if (!isKnownSendability(component))
+        return delay();
+      break;
+    }
     case KeyPathExpr::Component::Kind::UnresolvedSubscript:
     case KeyPathExpr::Component::Kind::Subscript: {
-      if (Context.LangOpts.hasFeature(Feature::InferSendableFromCaptures)) {
-        // Key path is sendable only when all of its captures are sendable.
-        if (auto *args = component.getSubscriptArgs()) {
-          auto *sendable = Context.getProtocol(KnownProtocolKind::Sendable);
-
-          for (const auto &arg : *args) {
-            // No need to check more or delay since we already known
-            // that the type is not Sendable.
-            if (!isSendable)
-              break;
-
-            auto argTy = simplifyType(getType(arg.getExpr()));
-
-            // Sendability cannot be determined until the argument
-            // is fully resolved.
-            if (argTy->hasTypeVariable())
-              return delay();
-
-            auto conformance = lookupConformance(argTy, sendable);
-            isSendable &=
-                bool(conformance) &&
-                !conformance.hasMissingConformance();
-          }
-        }
-      }
+      if (!isKnownSendability(component))
+        return delay();
       LLVM_FALLTHROUGH;
     }
-    case KeyPathExpr::Component::Kind::Property:
-    case KeyPathExpr::Component::Kind::UnresolvedProperty: {
+    case KeyPathExpr::Component::Kind::Member:
+    case KeyPathExpr::Component::Kind::UnresolvedMember: {
       auto *componentLoc =
           getConstraintLocator(keyPath, LocatorPathElt::KeyPathComponent(i));
       auto *calleeLoc = getCalleeLocator(componentLoc);
@@ -5047,18 +5163,19 @@ ConstraintSystem::inferKeyPathLiteralCapability(KeyPathExpr *keyPath) {
       if (!choice.isDecl())
         return fail();
 
-      auto storage = dyn_cast<AbstractStorageDecl>(choice.getDecl());
-
       if (hasFixFor(componentLoc, FixKind::AllowInvalidRefInKeyPath) ||
           hasFixFor(componentLoc, FixKind::UnwrapOptionalBase) ||
           hasFixFor(componentLoc,
                     FixKind::UnwrapOptionalBaseWithOptionalResult))
         return fail();
 
-      if (!storage)
+      auto *storageDecl = dyn_cast<AbstractStorageDecl>(choice.getDecl());
+      if (!isa<AbstractFunctionDecl>(choice.getDecl()) && !storageDecl) {
         return fail();
+      }
 
-      switch (getActorIsolation(storage)) {
+      // Shared switch logic for actor isolation.
+      switch (getActorIsolation(choice.getDecl())) {
       case ActorIsolation::Unspecified:
       case ActorIsolation::Nonisolated:
       case ActorIsolation::CallerIsolationInheriting:
@@ -5068,22 +5185,24 @@ ConstraintSystem::inferKeyPathLiteralCapability(KeyPathExpr *keyPath) {
       case ActorIsolation::Erased:
         llvm_unreachable("storage cannot have opaque isolation");
 
-      // A reference to an actor isolated state make key path non-Sendable.
+      // A reference to an actor-isolated state makes key path non-Sendable.
       case ActorIsolation::ActorInstance:
       case ActorIsolation::GlobalActor:
         isSendable = false;
         break;
       }
 
-      if (isReadOnlyKeyPathComponent(storage, component.getLoc())) {
-        mutability = KeyPathMutability::ReadOnly;
-        continue;
-      }
+      if (storageDecl) {
+        if (isReadOnlyKeyPathComponent(storageDecl, component.getLoc())) {
+          mutability = KeyPathMutability::ReadOnly;
+          continue;
+        }
 
-      // A nonmutating setter indicates a reference-writable base.
-      if (!storage->isSetterMutating()) {
-        mutability = KeyPathMutability::ReferenceWritable;
-        continue;
+        // A nonmutating setter indicates a reference-writable base.
+        if (!storageDecl->isSetterMutating()) {
+          mutability = KeyPathMutability::ReferenceWritable;
+          continue;
+        }
       }
 
       // Otherwise, the key path maintains its current capability.

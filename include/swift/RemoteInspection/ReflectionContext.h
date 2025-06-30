@@ -22,6 +22,7 @@
 #include "llvm/BinaryFormat/MachO.h"
 #include "llvm/BinaryFormat/ELF.h"
 #include "llvm/Object/COFF.h"
+#include "llvm/Support/Error.h"
 #include "llvm/Support/Memory.h"
 #include "llvm/ADT/STLExtras.h"
 
@@ -134,11 +135,13 @@ class ReflectionContext
   std::vector<std::tuple<RemoteAddress, RemoteAddress>> dataRanges;
 
   bool setupTargetPointers = false;
+  typename super::StoredPointer target_asyncTaskMetadata = 0;
   typename super::StoredPointer target_non_future_adapter = 0;
   typename super::StoredPointer target_future_adapter = 0;
   typename super::StoredPointer target_task_wait_throwing_resume_adapter = 0;
   typename super::StoredPointer target_task_future_wait_resume_adapter = 0;
   bool supportsPriorityEscalation = false;
+  typename super::StoredSize asyncTaskSize = 0;
 
 public:
   using super::getBuilder;
@@ -184,6 +187,7 @@ public:
     bool IsFuture;
     bool IsGroupChildTask;
     bool IsAsyncLetTask;
+    bool IsSynchronousStartTask;
 
     // Task flags.
     unsigned MaxPriority;
@@ -193,6 +197,7 @@ public:
     bool HasIsRunning; // If false, the IsRunning flag is not valid.
     bool IsRunning;
     bool IsEnqueued;
+    bool IsComplete;
 
     bool HasThreadPort;
     uint32_t ThreadPort;
@@ -202,6 +207,7 @@ public:
     StoredPointer AllocatorSlabPtr;
     std::vector<StoredPointer> ChildTasks;
     std::vector<StoredPointer> AsyncBacktraceFrames;
+    StoredPointer ResumeAsyncContext;
   };
 
   struct ActorInfo {
@@ -1014,7 +1020,7 @@ public:
       auto CDAddr = this->readCaptureDescriptorFromMetadata(*MetadataAddress);
       if (!CDAddr)
         return nullptr;
-      if (!CDAddr->isResolved())
+      if (!CDAddr->getResolvedAddress())
         return nullptr;
 
       // FIXME: Non-generic SIL boxes also use the HeapLocalVariable metadata
@@ -1037,10 +1043,12 @@ public:
       // Generic SIL @box type - there is always an instantiated metadata
       // pointer for the boxed type.
       if (auto Meta = readMetadata(*MetadataAddress)) {
-        auto GenericHeapMeta =
-          cast<TargetGenericBoxHeapMetadata<Runtime>>(Meta.getLocalBuffer());
-        return getMetadataTypeInfo(GenericHeapMeta->BoxedType,
-                                   ExternalTypeInfo);
+        if (auto *GenericHeapMeta = cast<TargetGenericBoxHeapMetadata<Runtime>>(
+                Meta.getLocalBuffer())) {
+          auto MetadataAddress = GenericHeapMeta->BoxedType;
+          auto TR = readTypeFromMetadata(MetadataAddress);
+          return getTypeInfo(TR, ExternalTypeInfo);
+        }
       }
       return nullptr;
     }
@@ -1269,6 +1277,15 @@ public:
     }
   }
 
+  llvm::Expected<const TypeInfo &>
+  getTypeInfo(const TypeRef &TR, remote::TypeInfoProvider *ExternalTypeInfo) {
+    auto &TC = getBuilder().getTypeConverter();
+    const TypeInfo *TI = TC.getTypeInfo(&TR, ExternalTypeInfo);
+    if (!TI)
+      return llvm::createStringError(TC.takeLastError());
+    return *TI;
+  }
+  
   /// Given a typeref, attempt to calculate the unaligned start of this
   /// instance's fields. For example, for a type without a superclass, the start
   /// of the instance fields would after the word for the isa pointer and the
@@ -1382,7 +1399,7 @@ public:
 
     for (StoredSize i = 0; i < Count; i++) {
       auto &Element = ElementsData[i];
-      Call(Element.Type, Element.Proto);
+      Call(Element.Type, stripSignedPointer(Element.Proto));
     }
   }
 
@@ -1775,6 +1792,7 @@ private:
         TaskStatusFlags & ActiveTaskStatusFlags::IsStatusRecordLocked;
     Info.IsEscalated = TaskStatusFlags & ActiveTaskStatusFlags::IsEscalated;
     Info.IsEnqueued = TaskStatusFlags & ActiveTaskStatusFlags::IsEnqueued;
+    Info.IsComplete = TaskStatusFlags & ActiveTaskStatusFlags::IsComplete;
 
     setIsRunning(Info, AsyncTaskObj.get());
     std::tie(Info.HasThreadPort, Info.ThreadPort) =
@@ -1810,24 +1828,43 @@ private:
           ChildTask = RecordObj->FirstChild;
       }
 
-      while (ChildTask) {
+      while (ChildTask && ChildTaskLoopCount++ < ChildTaskLimit) {
+        // Read the child task.
+        auto ChildTaskObj = readObj<AsyncTaskType>(ChildTask);
+        if (!ChildTaskObj)
+          return {std::string("found unreadable child task pointer"), Info};
+
         Info.ChildTasks.push_back(ChildTask);
 
-        StoredPointer ChildFragmentAddr = ChildTask + sizeof(*AsyncTaskObj);
-        auto ChildFragmentObj =
-            readObj<ChildFragment<Runtime>>(ChildFragmentAddr);
-        if (ChildFragmentObj)
-          ChildTask = ChildFragmentObj->NextChild;
-        else
+        swift::JobFlags ChildJobFlags(AsyncTaskObj->Flags);
+        if (ChildJobFlags.task_isChildTask()) {
+          if (asyncTaskSize == 0)
+            return {std::string("target async task size unknown, unable to "
+                                "iterate child tasks"),
+                    Info};
+
+          StoredPointer ChildFragmentAddr = ChildTask + asyncTaskSize;
+          auto ChildFragmentObj =
+              readObj<ChildFragment<Runtime>>(ChildFragmentAddr);
+          if (ChildFragmentObj)
+            ChildTask = ChildFragmentObj->NextChild;
+          else
+            ChildTask = 0;
+        } else {
+          // No child fragment, so we're done iterating.
           ChildTask = 0;
+        }
       }
 
       RecordPtr = RecordObj->Parent;
     }
 
+    const auto TaskResumeContext = AsyncTaskObj->ResumeContextAndReserved[0];
+    Info.ResumeAsyncContext = TaskResumeContext;
+
     // Walk the async backtrace.
     if (Info.HasIsRunning && !Info.IsRunning) {
-      auto ResumeContext = AsyncTaskObj->ResumeContextAndReserved[0];
+      auto ResumeContext = TaskResumeContext;
       unsigned AsyncBacktraceLoopCount = 0;
       while (ResumeContext && AsyncBacktraceLoopCount++ < AsyncBacktraceLimit) {
         auto ResumeContextObj = readObj<AsyncContext<Runtime>>(ResumeContext);
@@ -1902,12 +1939,17 @@ private:
                 Fptr == target_task_wait_throwing_resume_adapter) ||
                (target_task_future_wait_resume_adapter &&
                 Fptr == target_task_future_wait_resume_adapter)) {
-      auto ContextBytes = getReader().readBytes(RemoteAddress(ResumeContextPtr),
-                                                sizeof(AsyncContext<Runtime>));
-      if (ContextBytes) {
-        auto ContextPtr =
-            reinterpret_cast<const AsyncContext<Runtime> *>(ContextBytes.get());
-        return stripSignedPointer(ContextPtr->ResumeParent);
+      // It's only safe to look through these adapters when there's a dependency
+      // record. If there isn't a dependency record, then the task was resumed
+      // and the pointers are potentially stale.
+      if (AsyncTaskObj->PrivateStorage.DependencyRecord) {
+        auto ContextBytes = getReader().readBytes(
+            RemoteAddress(ResumeContextPtr), sizeof(AsyncContext<Runtime>));
+        if (ContextBytes) {
+          auto ContextPtr = reinterpret_cast<const AsyncContext<Runtime> *>(
+              ContextBytes.get());
+          return stripSignedPointer(ContextPtr->ResumeParent);
+        }
       }
     }
 
@@ -1918,7 +1960,7 @@ private:
     if (setupTargetPointers)
       return;
 
-    auto getFunc = [&](const std::string &name) -> StoredPointer {
+    auto getPointer = [&](const std::string &name) -> StoredPointer {
       auto Symbol = getReader().getSymbolAddress(name);
       if (!Symbol)
         return 0;
@@ -1927,18 +1969,26 @@ private:
         return 0;
       return Pointer->getResolvedAddress().getAddressData();
     };
+    target_asyncTaskMetadata =
+        getPointer("_swift_concurrency_debug_asyncTaskMetadata");
     target_non_future_adapter =
-        getFunc("_swift_concurrency_debug_non_future_adapter");
-    target_future_adapter = getFunc("_swift_concurrency_debug_future_adapter");
-    target_task_wait_throwing_resume_adapter =
-        getFunc("_swift_concurrency_debug_task_wait_throwing_resume_adapter");
+        getPointer("_swift_concurrency_debug_non_future_adapter");
+    target_future_adapter =
+        getPointer("_swift_concurrency_debug_future_adapter");
+    target_task_wait_throwing_resume_adapter = getPointer(
+        "_swift_concurrency_debug_task_wait_throwing_resume_adapter");
     target_task_future_wait_resume_adapter =
-        getFunc("_swift_concurrency_debug_task_future_wait_resume_adapter");
+        getPointer("_swift_concurrency_debug_task_future_wait_resume_adapter");
     auto supportsPriorityEscalationAddr = getReader().getSymbolAddress(
         "_swift_concurrency_debug_supportsPriorityEscalation");
     if (supportsPriorityEscalationAddr) {
       getReader().readInteger(supportsPriorityEscalationAddr,
                               &supportsPriorityEscalation);
+    }
+    auto asyncTaskSizeAddr =
+        getReader().getSymbolAddress("_swift_concurrency_debug_asyncTaskSize");
+    if (asyncTaskSizeAddr) {
+      getReader().readInteger(asyncTaskSizeAddr, &asyncTaskSize);
     }
 
     setupTargetPointers = true;
@@ -1979,7 +2029,7 @@ private:
     std::set<std::pair<const TypeRef *, const MetadataSource *>> Done;
     GenericArgumentMap Subs;
 
-    ArrayRef<const TypeRef *> CaptureTypes = Info.CaptureTypes;
+    llvm::ArrayRef<const TypeRef *> CaptureTypes = Info.CaptureTypes;
 
     // Closure context element layout depends on the layout of the
     // captured types, but captured types might depend on element
